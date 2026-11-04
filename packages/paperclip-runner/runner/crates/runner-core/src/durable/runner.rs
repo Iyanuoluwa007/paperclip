@@ -49,7 +49,7 @@ enum CommandLifecycle {
 const TERMINAL_RESULT_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const CUMULATIVE_ACK_PERSIST_INTERVAL: usize = 16;
 
-fn sleep_for_reconnect(base: Duration, max_delay: Duration, attempt: &mut u32) {
+fn reconnect_delay(base: Duration, max_delay: Duration, attempt: &mut u32) -> Duration {
     let multiplier = 1_u128 << (*attempt).min(5);
     let uncapped = base.as_millis().saturating_mul(multiplier);
     let capped = uncapped.clamp(1, 5_000) as u64;
@@ -58,17 +58,7 @@ fn sleep_for_reconnect(base: Duration, max_delay: Duration, attempt: &mut u32) {
         .map_or(0, |duration| u64::from(duration.subsec_nanos()));
     let jitter_percent = 75 + nanos % 51;
     *attempt = attempt.saturating_add(1);
-    let delay = Duration::from_millis(capped.saturating_mul(jitter_percent) / 100).min(max_delay);
-    if !delay.is_zero() {
-        thread::sleep(delay);
-    }
-}
-
-fn sleep_before_deadline(delay: Duration, deadline: Instant) {
-    let bounded_delay = delay.min(deadline.saturating_duration_since(Instant::now()));
-    if !bounded_delay.is_zero() {
-        thread::sleep(bounded_delay);
-    }
+    Duration::from_millis(capped.saturating_mul(jitter_percent) / 100).min(max_delay)
 }
 
 fn connection_attempt_deadline(
@@ -493,6 +483,7 @@ pub fn run_durable_runner<E: CommandExecutor>(
     let mut authenticated_once = false;
     let mut disconnected_since: Option<Instant> = None;
     let mut reconnect_attempt = 0_u32;
+    let mut next_connection_attempt = Instant::now();
 
     loop {
         if authenticated_once {
@@ -541,6 +532,13 @@ pub fn run_durable_runner<E: CommandExecutor>(
             ));
         }
 
+        if authenticated_once {
+            poll_disconnected_executor_events(&mut state, &store, &config, &mut executor)?;
+        }
+        if let Some(remaining) = next_connection_attempt.checked_duration_since(Instant::now()) {
+            thread::sleep(remaining.min(Duration::from_millis(25)));
+            continue;
+        }
         let using_bootstrap = lease.is_none();
         let connect_deadline = connection_attempt_deadline(&config, started, disconnected_since);
         let connection = AuthenticatedTransport::connect(
@@ -554,7 +552,7 @@ pub fn run_durable_runner<E: CommandExecutor>(
         let (mut transport, welcome) = match connection {
             Ok(Some(connection)) => connection,
             Ok(None) => {
-                sleep_before_deadline(config.reconnect_delay, connect_deadline);
+                next_connection_attempt = Instant::now() + config.reconnect_delay;
                 continue;
             }
             Err(error) => {
@@ -571,11 +569,12 @@ pub fn run_durable_runner<E: CommandExecutor>(
                         "bootstrap connection failed closed; provide a fresh one-use ticket",
                     ));
                 }
-                sleep_for_reconnect(
-                    config.reconnect_delay,
-                    connect_deadline.saturating_duration_since(Instant::now()),
-                    &mut reconnect_attempt,
-                );
+                next_connection_attempt = Instant::now()
+                    + reconnect_delay(
+                        config.reconnect_delay,
+                        connect_deadline.saturating_duration_since(Instant::now()),
+                        &mut reconnect_attempt,
+                    );
                 continue;
             }
         };
@@ -860,7 +859,10 @@ pub fn run_durable_runner<E: CommandExecutor>(
             store.save(&state)?;
             let reconnect_deadline =
                 connection_attempt_deadline(&config, started, disconnected_since);
-            sleep_before_deadline(config.reconnect_delay, reconnect_deadline);
+            next_connection_attempt = Instant::now()
+                + config
+                    .reconnect_delay
+                    .min(reconnect_deadline.saturating_duration_since(Instant::now()));
             continue;
         }
         loop {
@@ -1163,7 +1165,10 @@ pub fn run_durable_runner<E: CommandExecutor>(
         }
         disconnected_since.get_or_insert_with(Instant::now);
         let reconnect_deadline = connection_attempt_deadline(&config, started, disconnected_since);
-        sleep_before_deadline(config.reconnect_delay, reconnect_deadline);
+        next_connection_attempt = Instant::now()
+            + config
+                .reconnect_delay
+                .min(reconnect_deadline.saturating_duration_since(Instant::now()));
     }
 }
 
@@ -1714,6 +1719,39 @@ fn stop_after_terminal_result_delivery_failure<E: CommandExecutor>(
     store.save(state)?;
     let _ = shutdown_preserving_cleanup(state, executor);
     Err(error)
+}
+
+fn poll_disconnected_executor_events<E: CommandExecutor>(
+    state: &mut DurableState,
+    store: &DurableStateStore,
+    config: &DurableRunnerConfig,
+    executor: &mut E,
+) -> Result<(), DurableRunnerError> {
+    if state.warm_transition.is_some() || state.pending_terminal_delivery.is_some() {
+        return Ok(());
+    }
+    // Keep the rejected suffix at its provider owner until a reconnect ACK
+    // frees outbox space. Offline polling never resolves tools or approvals.
+    let polled = if state.backpressure {
+        executor.maintain_backpressured_provider()
+    } else {
+        poll_executor_events(state, store, config, executor)
+    };
+    match polled {
+        Err(error)
+            if error.classification() == Some("outbox_backpressure")
+                && !state.outbox.is_empty() =>
+        {
+            store.save(state)
+        }
+        Err(error) => {
+            let _ = shutdown_preserving_cleanup(state, executor);
+            state.record_diagnostic(format!("disconnected provider ingestion failed: {error}"));
+            store.save(state)?;
+            Err(error)
+        }
+        Ok(()) => Ok(()),
+    }
 }
 
 fn poll_executor_events_after_controller_ack<E: CommandExecutor>(
@@ -4070,6 +4108,91 @@ mod tests {
         let (fully_acked, _) = store.load_or_create(&config).unwrap();
         assert_eq!(fully_acked.acked_source_seq, 128);
         assert!(fully_acked.outbox.is_empty());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn disconnected_ingestion_keeps_durable_prefix_and_resumes_after_backpressure_ack() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-runner-offline-backpressure-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let mut config = config(directory.clone());
+        config.max_outbox_bytes = 16 * 1024;
+        let store = DurableStateStore::new(&directory).unwrap();
+        let (mut state, _) = store.load_or_create(&config).unwrap();
+        let mut executor = RetainingEventExecutor {
+            events: (1..=128)
+                .map(|index| PolledEvent {
+                    executor_event_id: format!("offline-{index}"),
+                    event_type: "item.delta".to_owned(),
+                    priority: EventPriority::P1,
+                    payload: json!({"index":index,"text":"x".repeat(512)}),
+                })
+                .collect(),
+            fail_acknowledgement: false,
+            acknowledgements: Vec::new(),
+        };
+        poll_disconnected_executor_events(&mut state, &store, &config, &mut executor).unwrap();
+        assert!(state.backpressure);
+        assert!(!state.outbox.is_empty());
+        assert!(!executor.events.is_empty());
+        assert_eq!(state.outbox.len() + executor.events.len(), 128);
+        assert_eq!(state.last_controller_command_seq, 0);
+        let (reloaded, _) = store.load_or_create(&config).unwrap();
+        assert_eq!(reloaded.outbox, state.outbox);
+        assert!(reloaded.backpressure);
+        let prefix = state.highest_source_seq();
+        poll_disconnected_executor_events(&mut state, &store, &config, &mut executor).unwrap();
+        assert_eq!(state.highest_source_seq(), prefix);
+        while !executor.events.is_empty() {
+            state.apply_ack(state.highest_source_seq(), 2).unwrap();
+            poll_disconnected_executor_events(&mut state, &store, &config, &mut executor).unwrap();
+        }
+        assert_eq!(state.highest_source_seq(), 128);
+        assert_eq!(executor.acknowledgements.iter().sum::<usize>(), 128);
+        assert!(state.peak_outbox_bytes <= config.max_outbox_bytes);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn disconnected_ingestion_retires_provider_on_unrecoverable_output() {
+        struct OversizedExecutor {
+            shutdowns: usize,
+        }
+        impl CommandExecutor for OversizedExecutor {
+            fn execute(&mut self, _: &Command) -> Result<CommandExecution, DurableRunnerError> {
+                panic!("offline ingestion cannot execute commands");
+            }
+            fn poll_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+                Ok(vec![PolledEvent {
+                    executor_event_id: "oversized".to_owned(),
+                    event_type: "item.delta".to_owned(),
+                    priority: EventPriority::P1,
+                    payload: json!({"text":"x".repeat(2048)}),
+                }])
+            }
+            fn shutdown(&mut self) -> Result<(), DurableRunnerError> {
+                self.shutdowns += 1;
+                Ok(())
+            }
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-runner-offline-output-failure-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let mut config = config(directory.clone());
+        config.max_frame_bytes = 1024;
+        let store = DurableStateStore::new(&directory).unwrap();
+        let (mut state, _) = store.load_or_create(&config).unwrap();
+        let mut executor = OversizedExecutor { shutdowns: 0 };
+        let error = poll_disconnected_executor_events(&mut state, &store, &config, &mut executor)
+            .unwrap_err();
+        assert!(error.to_string().contains("transport frame limit"));
+        assert_eq!(executor.shutdowns, 1);
+        assert_eq!(state.highest_source_seq(), 0);
         fs::remove_dir_all(directory).unwrap();
     }
 

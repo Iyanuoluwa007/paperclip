@@ -41,6 +41,13 @@ source sequence the runner has produced; acknowledged prefixes are removed
 atomically from durable state. After disconnect, every remaining event is sent
 again with the same identity and source sequence.
 
+After its first authenticated connection, an active Runner continues polling
+provider output into that same outbox between reconnect attempts, including
+during reconnect backoff. Authentication attempts retain their existing bounded
+timeout. Unanswered tools and approvals remain pending until the controller
+returns. Terminal-delivery and authority-transition reconciliation do not
+restart provider polling.
+
 Executors retain polled events until runnerd acknowledges each event after its
 outbox commit. Batches commit one event at a time, so a later oversized event or
 capacity failure cannot roll back the accepted prefix or discard the
@@ -68,6 +75,14 @@ The outbox has separate hard and reserved limits. P1/P2 events cannot consume
 the P0 reserve. When the soft limit is reached, the runner enters backpressure
 and rejects the new non-P0 event rather than silently losing it. Exhausting the
 P0 reserve is an explicit unrecoverable condition.
+
+While disconnected, soft-limit backpressure retains the rejected event and its
+suffix at the provider owner until replay ACKs free outbox space. Oversized
+events or exhausted hard limits stop the owned provider and preserve the
+accepted durable prefix. The ACPX sidecar separately caps queued stdout at
+4 MiB; exceeding that bound requests owned provider shutdown and records a
+failure rather than allowing unbounded process memory while the Runner cannot
+read.
 
 ## Recovering Codex between turns
 

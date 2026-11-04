@@ -112,6 +112,8 @@ import { AcpxTurnControlLedger, parseAcpxTurnControl } from "../drivers/acpx/tur
 const turnControls = new AcpxTurnControlLedger();
 const MAX_PENDING_TOOLS = 512;
 const MAX_PENDING_INPUTS = 16;
+const MAX_BUFFERED_OUTPUT_BYTES = 4 * ACPX_SIDECAR_MAX_FRAME_BYTES;
+let outputFailed = false;
 let goalSourceRevision = 0;
 function observedGoalProjection(...args: Parameters<typeof acpxGoalProjection>) {
   return { ...acpxGoalProjection(...args), providerRevision: ++goalSourceRevision };
@@ -1474,9 +1476,17 @@ function response(
 }
 
 function writeFrame(value: AcpxSidecarEvent | AcpxSidecarResponse): boolean {
+  if (outputFailed) return false;
   const line = stringifyAcpxSidecarFrame(value);
-  if (Buffer.byteLength(line) > ACPX_SIDECAR_MAX_FRAME_BYTES) {
+  const bytes = Buffer.byteLength(line);
+  if (bytes > ACPX_SIDECAR_MAX_FRAME_BYTES) {
     process.stderr.write("[paperclip-acpx-sidecar] output_frame_too_large\n");
+    return false;
+  }
+  if (process.stdout.writableLength + bytes + 1 > MAX_BUFFERED_OUTPUT_BYTES) {
+    outputFailed = true;
+    process.stderr.write("[paperclip-acpx-sidecar] output_buffer_limit_exceeded\n");
+    requestShutdown("ACPX sidecar output buffer limit exceeded");
     return false;
   }
   process.stdout.write(`${line}\n`);
@@ -1661,7 +1671,7 @@ async function shutdown(reason: string): Promise<void> {
   turnId = null;
   lines.close();
   process.stdin.pause();
-  process.exitCode = cleanupIncomplete ? 1 : 0;
+  process.exitCode = cleanupIncomplete || outputFailed ? 1 : 0;
 }
 
 function retainActiveHostCleanup(

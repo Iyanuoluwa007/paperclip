@@ -505,6 +505,20 @@ describe("qualified ACPX runtime sidecar", () => {
     }
   });
 
+  it("bounds aggregate blocked output and requests shutdown without consuming rejected event identities", () => {
+    const wire = loadActualSidecarWriter("backpressure");
+    expect(wire.emit("runtime.diagnostic", { message: "accepted" })).toBe(true);
+    wire.bufferedBytes(4 * ACPX_SIDECAR_MAX_FRAME_BYTES - 1);
+    expect(wire.emit("runtime.diagnostic", { message: "cannot fit" })).toBe(false);
+    expect(wire.sequence()).toBe(1);
+    expect(wire.shutdownReasons).toEqual(["ACPX sidecar output buffer limit exceeded"]);
+    expect(wire.errors).toEqual(["[paperclip-acpx-sidecar] output_buffer_limit_exceeded\n"]);
+    wire.bufferedBytes(0);
+    expect(wire.emit("runtime.turn_terminal", { status: "completed" })).toBe(false);
+    expect(wire.writes).toHaveLength(1);
+    expect(wire.shutdownReasons).toHaveLength(1);
+  });
+
 
   it.each(["success", "accepted-false", "error", "cancel", "timeout", "receiver-rejected"])(
     "commits normalized delivery only after the actual tool.resolve handler succeeds: %s",
@@ -1566,21 +1580,22 @@ function loadWaitForTool(input: {
 /** Actual producer and encoder, with only the destination stream replaced. */
 function loadActualSidecarWriter(mode: "normal" | "backpressure" | "throws" = "normal"): {
   emit: (eventType: string, payload: unknown) => boolean; sequence: () => number; writes: string[]; errors: string[];
+  bufferedBytes: (bytes: number) => void; shutdownReasons: string[];
 } {
   const source = readFileSync(new URL("./acpx-runtime-sidecar.ts", import.meta.url), "utf8");
   const emitStart = source.indexOf("function emit("), emitEnd = source.indexOf("\nfunction diagnostic", emitStart);
   const writeStart = source.indexOf("function writeFrame("), writeEnd = source.indexOf("\nfunction requireHost", writeStart);
   if (emitStart < 0 || emitEnd < 0 || writeStart < 0 || writeEnd < 0) throw new Error("Actual sidecar writer source not found");
-  const writes: string[] = [], errors: string[] = [];
-  const process = { stdout: { write: (line: string) => { if (mode === "throws") throw new Error("fixture write failed"); writes.push(line); return mode !== "backpressure"; } },
+  const writes: string[] = [], errors: string[] = [], shutdownReasons: string[] = [];
+  const process = { stdout: { writableLength: 0, write: (line: string) => { if (mode === "throws") throw new Error("fixture write failed"); writes.push(line); return mode !== "backpressure"; } },
     stderr: { write: (line: string) => { errors.push(line); return true; } } };
-  const writer = new Function("process", "stringifyAcpxSidecarFrame", "ACPX_SIDECAR_PROTOCOL_VERSION", "ACPX_SIDECAR_MAX_FRAME_BYTES", `
-    let sequence=0; const runId="test-run", turnId="test-turn";
+  const writer = new Function("process", "stringifyAcpxSidecarFrame", "ACPX_SIDECAR_PROTOCOL_VERSION", "ACPX_SIDECAR_MAX_FRAME_BYTES", "requestShutdown", `
+    let sequence=0, outputFailed=false; const runId="test-run", turnId="test-turn", MAX_BUFFERED_OUTPUT_BYTES=4*ACPX_SIDECAR_MAX_FRAME_BYTES;
     ${stripTypeScriptTypes(source.slice(emitStart, emitEnd))}
     ${stripTypeScriptTypes(source.slice(writeStart, writeEnd))}
     return { emit, sequence: () => sequence };
-  `)(process, stringifyAcpxSidecarFrame, ACPX_SIDECAR_PROTOCOL_VERSION, ACPX_SIDECAR_MAX_FRAME_BYTES);
-  return { ...writer, writes, errors };
+  `)(process, stringifyAcpxSidecarFrame, ACPX_SIDECAR_PROTOCOL_VERSION, ACPX_SIDECAR_MAX_FRAME_BYTES, (reason: string) => shutdownReasons.push(reason));
+  return { ...writer, writes, errors, bufferedBytes: bytes => { process.stdout.writableLength = bytes; }, shutdownReasons };
 }
 
 /** Actual parsed command dispatcher; only the owned pending map/turn are supplied. */

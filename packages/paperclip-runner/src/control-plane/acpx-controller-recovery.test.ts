@@ -2,7 +2,7 @@ import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import { createHash } from "node:crypto";
 import { createServer as createNetServer } from "node:net";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -39,7 +39,7 @@ function sidecarSource(root: string, selectedProfile = profile, agent = "claude"
     "const profileDigest = " + JSON.stringify(selectedProfile.commandDigest) + ";",
     "const protocolVersion = " + GENERATED_ACPX_SIDECAR_PROTOCOL_VERSION + ";",
     "const send = value => process.stdout.write(JSON.stringify(value) + '\\n');",
-    "let identity, runId, turnId = null, sequence = 0, lastAction = '';",
+    "let identity, runId, turnId = null, sequence = 0, lastAction = '', lastOfflineAction = '', pendingPermission = false;",
     "const event = (eventType, payload) => send({protocolVersion, sequence:++sequence, eventType, runId, turnId, payload});",
     "(async () => {",
     " const lease = async () => {for(let attempt=0;attempt<64;attempt++){const s=net.createServer();try{await new Promise((resolve,reject)=>{s.once('error',reject);s.listen(randomInt(49152,65536),'127.0.0.1',resolve);});return s;}catch(error){if(error.code!=='EADDRINUSE')throw error;}}throw new Error('No lifetime fence port available');};",
@@ -49,6 +49,7 @@ function sidecarSource(root: string, selectedProfile = profile, agent = "claude"
     " const reply = (r,result) => send({protocolVersion,id:r.id,ok:true,result});",
     " const lines=rl.createInterface({input:process.stdin}); lines.on('close',()=>process.exit(0)); lines.on('line', line => {",
     "  const r=JSON.parse(line), p=r.params || {};",
+    "  fs.appendFileSync(root+'/commands.jsonl',r.command+'\\n');",
     "  if(r.command==='session.open'&&fs.existsSync(root+'/startup-failure.json')){send({protocolVersion,id:r.id,ok:false,error:{code:'ACPX_SESSION_ENSURE_FAILED',message:'Internal error',retryable:false,providerFailure:JSON.parse(fs.readFileSync(root+'/startup-failure.json','utf8'))}});return;}",
     "  switch(r.command) {",
     "   case 'initialize': reply(r,{protocolVersion,sidecarPid:process.pid,profile:{agent:" + JSON.stringify(agent) + "},capabilities:{persistentSessions:true,exactModelVerification:true,permissions:'runner_policy',semanticTools:'runner_bridge',structuredInput:'paperclip.question_set.v1'}});break;",
@@ -56,7 +57,8 @@ function sidecarSource(root: string, selectedProfile = profile, agent = "claude"
     "   case 'run.attach': runId=p.runId; reply(r,{runId,catalogRevision:p.catalogRevision});break;",
     "   case 'session.goal.get': reply(r,{schema:'paperclip.session_goal.snapshot.v1',goal:null,workingNow:false,sessionGoals:{availability:'unsupported',actions:[],autonomousUpdates:false,persistentAcrossResume:false,maxObjectiveChars:4000,tokenBudgetControl:false,usageReporting:false}});break;",
     "   case 'turn.start': turnId=p.turnId;reply(r,{turnId,turnControls:{steering:false,queuedFollowUp:false}});event('runtime.event',{type:'text_delta',text:'started'});break;",
-    "   case 'session.snapshot': reply(r,{identity,runId,turnId,pendingRuntimeRequests:[]});break;",
+    "   case 'session.snapshot': reply(r,{identity,runId,turnId,pendingRuntimeRequests:pendingPermission?[{requestId:'permission-1',type:'permission',turnId}]:[]});break;",
+    "   case 'permission.resolve': if(!pendingPermission)throw new Error('duplicate approval effect');pendingPermission=false;fs.appendFileSync(root+'/approval-effects','approved\\n');reply(r,{resolved:true});break;",
     "   case 'turn.cancel': reply(r,{cancelled:true});event('runtime.turn_terminal',{status:'interrupted'});turnId=null;break;",
     "   case 'session.suspend': reply(r,{identity});break;",
     "   case 'session.close': reply(r,{closed:true});break;",
@@ -64,6 +66,7 @@ function sidecarSource(root: string, selectedProfile = profile, agent = "claude"
     "  }",
     " });",
     " setInterval(()=>{if(!turnId)return;let action;try{action=fs.readFileSync(root+'/action','utf8');}catch{return;}if(action===lastAction)return;lastAction=action;if(action==='progress'){event('runtime.event',{type:'text_delta',text:'work-during-outage'});fs.writeFileSync(root+'/progress-receipt',String(process.pid));}if(action==='complete'){event('runtime.turn_terminal',{status:'completed'});turnId=null;fs.writeFileSync(root+'/complete-receipt',String(process.pid));}if(action==='exit'){fs.writeFileSync(root+'/exit-receipt',String(process.pid));process.exit(9);}},10);",
+    " setInterval(()=>{if(!turnId)return;let action;try{action=fs.readFileSync(root+'/offline-action','utf8');}catch{return;}if(action===lastOfflineAction)return;lastOfflineAction=action;if(action==='burst'){for(let i=0;i<288;i++)event('runtime.event',{type:'text_delta',text:'offline-'+i+':'+'x'.repeat(512)});}if(action==='approval'){pendingPermission=true;event('runtime.permission_requested',{requestId:'permission-1',kind:'edit',title:'Write the file?',choices:[{key:'accept',label:'Allow once'},{key:'cancel',label:'Deny'}]});}},10);",
     "})().catch(e=>{process.stderr.write(String(e));process.exit(1);});",
   ].join("\n");
 }
@@ -85,7 +88,7 @@ it("preserves a startup provider failure through the real sidecar transport and 
   } finally { await run.cleanup(); }
 }, 20_000);
 
-async function fixture(maxLifetimeMs?: number, candidateAdmission?: AcpxCandidateStartupAdmission, beforeLaunchDelayMs = 0) {
+async function fixture(maxLifetimeMs?: number, candidateAdmission?: AcpxCandidateStartupAdmission, beforeLaunchDelayMs = 0, reconnectGraceMs = 15_000) {
   const root = mkdtempSync(resolve(tmpdir(), "acpx-controller-recovery-"));
   const { executable: nodeCommand } = await copyOwnedNodeRuntime(resolve(root, "node"));
   const stateDirectory = resolve(root, "control-plane");
@@ -122,7 +125,7 @@ async function fixture(maxLifetimeMs?: number, candidateAdmission?: AcpxCandidat
     "--runner-id",identity.runnerInstanceId,"--environment-lease-id",identity.environmentLeaseId,
     "--run-id",identity.runId,"--session-id",identity.normalizedSessionId,"--turn-id",identity.turnId,"--item-id",identity.itemId,
     "--runner-version",expectedRunnerVersion,"--runner-digest",expectedRunnerDigest,"--max-runtime-ms","0",
-    "--reconnect-grace-ms","15000","--reconnect-delay-ms","25","--acpx-launch-authority-digest","sha256:"+"d".repeat(64),
+    "--reconnect-grace-ms",String(reconnectGraceMs),"--reconnect-delay-ms","25","--acpx-launch-authority-digest","sha256:"+"d".repeat(64),
     "--acpx-sidecar-command",nodeCommand,"--acpx-sidecar-command-sha256",digest(nodeCommand),
     "--acpx-sidecar-script",script,"--acpx-sidecar-script-sha256",digest(script),
     ...(candidateAdmission ? ["--acpx-candidate-admission-json", JSON.stringify(candidateAdmission)] : [])];
@@ -131,7 +134,7 @@ async function fixture(maxLifetimeMs?: number, candidateAdmission?: AcpxCandidat
   const bounded = maxLifetimeMs === undefined ? undefined : spawnRunner({
     connectUrl: controller.connectUrl, stateDirectory: resolve(root, "runner"), identity, ticket,
     maxOutboxBytes: 16 * 1024 * 1024, p0ReserveBytes: 1024 * 1024,
-    maxRuntimeMs: 0, maxLifetimeMs: deadlineAt! - Date.now(), reconnectGraceMs: 15_000,
+    maxRuntimeMs: 0, maxLifetimeMs: deadlineAt! - Date.now(), reconnectGraceMs,
     runnerBinaryPath: binary, runnerVersion: expectedRunnerVersion, runnerDigest: expectedRunnerDigest,
     acpxLaunchProfile: { ...(candidateAdmission ? { candidateAdmission } : {}), authorityDigest: `sha256:${"d".repeat(64)}`, command: nodeCommand, commandSha256: digest(nodeCommand),
       sidecarScript: script, sidecarScriptSha256: digest(script) },
@@ -156,6 +159,8 @@ async function fixture(maxLifetimeMs?: number, candidateAdmission?: AcpxCandidat
       try { runnerDiagnostics = JSON.parse(readFileSync(resolve(root, "runner/runner-state.json"), "utf8")).diagnostics?.slice(-8); } catch { /* Startup may not have created state. */ }
       throw new Error("Hermetic Runner command did not settle: " + JSON.stringify({ id, type,
         authenticatedConnections: controller.activeRunnerConnectionCount(), command: controller.getCommand(id),
+        malformedFrames: controller.store.state.malformedFrames, acceptedConnections: controller.store.state.connectionCount,
+        lastCommittedEvents: controller.store.state.committedEvents.slice(-4).map(event => ({ sourceSeq: event.sourceSeq, eventType: event.eventType })),
         remainingLifetimeMs: deadlineAt === undefined ? null : deadlineAt - Date.now(),
         exitCode: child.exitCode, signalCode: child.signalCode, stderr: diagnostics, runnerDiagnostics }).slice(-8192), { cause: error });
     }
@@ -331,6 +336,61 @@ it("recovers a turn that completed while its controller was offline",async()=>{
   }finally{await run.cleanup();}
 },20000);
 
+it("durably drains noisy active output and one offline terminal before its controller returns", async () => {
+  const run = await fixture(undefined, undefined, 0, 60_000);
+  const runnerState = () => JSON.parse(readFileSync(resolve(run.root, "runner/runner-state.json"), "utf8"));
+  try {
+    await run.ready();
+    expect(await run.command("turn.start", { turnId: "provider-turn-1", text: "Finish the admitted work offline" })).toMatchObject({ status: "completed" });
+    const pid = run.launches()[0].pid;
+    await run.stopController();
+    writeFileSync(resolve(run.root, "offline-action"), "burst");
+    await vi.waitFor(() => expect(runnerState().outbox.some((event: any) => event.envelope.payload.payload.text?.startsWith("offline-287:"))).toBe(true), { timeout: 20_000 });
+    writeFileSync(resolve(run.root, "action"), "complete");
+    await vi.waitFor(() => expect(runnerState().outbox.filter((event: any) => event.eventType === "turn.completed")).toHaveLength(1), { timeout: 5000 });
+    const offline = runnerState();
+    expect(offline.peakOutboxBytes).toBeLessThanOrEqual(offline.maxOutboxBytes);
+    expect(() => process.kill(pid, 0)).not.toThrow();
+    await run.replaceController();
+    await vi.waitFor(() => expect(run.controller().store.state.committedEvents.some(event => event.sourceSeq === offline.nextSourceSeq - 1)).toBe(true), { timeout: 10_000 });
+    const replay = new Map(run.controller().store.state.committedEvents.map(event => [event.sourceSeq, event.sourceEventId]));
+    for (const event of offline.outbox) expect(replay.get(event.sourceSeq)).toBe(event.envelope.payload.sourceEventId);
+    expect(run.controller().store.state.committedEvents.filter(event => event.eventType === "turn.completed")).toHaveLength(1);
+    expect(run.launches()).toHaveLength(1);
+    expect(readFileSync(resolve(run.root, "commands.jsonl"), "utf8").split("\n").filter(command => command === "turn.start")).toHaveLength(1);
+  } finally { await run.cleanup(); }
+}, 45_000);
+
+it("remains silent at an offline approval and resolves the original request exactly once after adoption", async () => {
+  const run = await fixture();
+  const runnerState = () => JSON.parse(readFileSync(resolve(run.root, "runner/runner-state.json"), "utf8"));
+  try {
+    await run.ready();
+    expect(await run.command("turn.start", { turnId: "provider-turn-1", text: "Wait for approval" })).toMatchObject({ status: "completed" });
+    await run.stopController();
+    writeFileSync(resolve(run.root, "offline-action"), "approval");
+    await vi.waitFor(() => expect(runnerState().outbox.some((event: any) => event.eventType === "runtime_request.created")).toBe(true), { timeout: 5000 });
+    const waiting = runnerState();
+    await new Promise(resolveSilence => setTimeout(resolveSilence, 250));
+    expect(runnerState().nextSourceSeq).toBe(waiting.nextSourceSeq);
+    expect(existsSync(resolve(run.root, "approval-effects"))).toBe(false);
+    await run.replaceController();
+    const snapshot = await run.command("session.snapshot", { includePendingRuntimeRequests: true });
+    expect(snapshot).toMatchObject({ status: "completed", result: { result: {
+      activeProviderTurnId: "provider-turn-1", runtimeRequestsLive: true,
+      pendingRuntimeRequests: [{ requestId: "permission-1", type: "permission", status: "pending" }],
+    } } });
+    expect(existsSync(resolve(run.root, "approval-effects"))).toBe(false);
+    const resolution = await run.command("request.resolve", { requestId: "permission-1", resolution: { action: "accept" } });
+    expect(resolution).toMatchObject({ status: "completed" });
+    expect(await run.command("request.resolve", { requestId: "permission-1", resolution: { action: "accept" } })).toMatchObject({ status: "failed" });
+    expect(readFileSync(resolve(run.root, "approval-effects"), "utf8")).toBe("approved\n");
+    writeFileSync(resolve(run.root, "action"), "complete");
+    await vi.waitFor(() => expect(run.controller().store.state.committedEvents.filter(event => event.eventType === "turn.completed")).toHaveLength(1), { timeout: 5000 });
+    expect(run.launches()).toHaveLength(1);
+  } finally { await run.cleanup(); }
+}, 25_000);
+
 it("distinguishes a provider-process crash from controller replacement",async()=>{
   const run=await fixture();
   try{
@@ -346,18 +406,16 @@ it("distinguishes a provider-process crash from controller replacement",async()=
         probe.listen(port,"127.0.0.1",()=>probe.close(error=>error?reject(error):resolveFree()));
       });
     },{timeout:3000});
+    await vi.waitFor(() => {
+      const saved = JSON.parse(readFileSync(resolve(run.root, "runner/runner-state.json"), "utf8"));
+      expect(saved.outbox.filter((event: any) => event.eventType === "turn.failed")).toHaveLength(1);
+    }, { timeout: 5000 });
     await run.replaceController();
     const result=await run.command("session.snapshot",{includePendingRuntimeRequests:true});
-    expect(result,JSON.stringify(result)).toMatchObject({status:"failed",result:{result:{code:"command_execution_failed"}}});
-    const message = (result.result as {result:{message:string}}).result.message;
-    const lossReasons = [
-      "ACPX request snapshot requires a live provider",
-      "ACPX sidecar request transport failed at session.snapshot: command serialization failed: Broken pipe (os error 32)",
-      "ACPX sidecar request transport failed at session.snapshot: failed to write process command: Broken pipe (os error 32)",
-      "ACPX sidecar exited at session.snapshot: exitCode=Some(9) signal=None",
-      "ACPX sidecar closed stdout at session.snapshot",
-    ];
-    expect(lossReasons.map(reason => `ACPX live request snapshot failed: ${reason}`)).toContain(message);
+    expect(result,JSON.stringify(result)).toMatchObject({status:"failed",result:{result:{
+      code:"command_execution_failed", message:"ACPX request snapshot requires the surviving provider",
+    }}});
+    await vi.waitFor(() => expect(run.controller().store.state.committedEvents.filter(event => event.eventType === "turn.failed")).toHaveLength(1), { timeout: 5000 });
     expect(run.launches()).toHaveLength(1);
   }finally{await run.cleanup();}
 },20000);

@@ -13,7 +13,10 @@ import { stripTypeScriptTypes } from "node:module";
 import { cursorPlanToolIdentity, cursorToolIdentity } from "../drivers/acpx/cursor-plan-tool-identity.js";
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import { createAcpxSidecarHostEnvironment, createSanitizedAcpxSpawnInput } from "../drivers/acpx/environment.js";
 import { createKimiMessageProjection } from "../drivers/acpx/kimi-message-boundary.js";
@@ -518,6 +521,70 @@ describe("qualified ACPX runtime sidecar", () => {
     expect(wire.writes).toHaveLength(1);
     expect(wire.shutdownReasons).toHaveLength(1);
   });
+
+  it("stops its owned provider under real stdout backpressure and exits with failure after draining", async () => {
+    const root = mkdtempSync(join(tmpdir(), "acpx-sidecar-output-pressure-"));
+    const loader = join(root, "provider-loader.mjs");
+    const fakeHost = new URL("../test-support/acpx-blocked-output-host.mjs", import.meta.url).href;
+    writeFileSync(loader, `import { registerHooks } from "node:module";
+      registerHooks({ resolve(specifier, context, next) {
+        if (context.parentURL?.includes("/acpx-runtime-sidecar.") && specifier.endsWith("/runtime-host.js")) {
+          return { url: ${JSON.stringify(fakeHost)}, shortCircuit: true };
+        }
+        return next(specifier, context);
+      } });`);
+    const child = spawn(process.execPath, ["--import", "tsx", "--import", loader,
+      fileURLToPath(new URL("./acpx-runtime-sidecar.ts", import.meta.url))],
+    { stdio: ["pipe", "pipe", "pipe"], env: { PATH: process.env.PATH, PAPERCLIP_TEST_OUTPUT_ROOT: root } });
+    const exited = once(child, "exit");
+    let stderr = "", stdout = "";
+    child.stderr.setEncoding("utf8").on("data", text => { stderr += text; });
+    child.stdout.setEncoding("utf8").on("data", text => { stdout += text; });
+    const send = (id: number, command: string, params: Record<string, unknown>) => {
+      child.stdin.write(`${JSON.stringify({ protocolVersion: ACPX_SIDECAR_PROTOCOL_VERSION, id, command, params })}\n`);
+    };
+    const response = async (id: number) => {
+      await vi.waitFor(() => {
+        expect(child.exitCode, stderr).toBeNull();
+        expect(stdout.split("\n").some(line => line && JSON.parse(line).id === id), stderr).toBe(true);
+      }, { timeout: 5000 });
+      const frame = stdout.split("\n").filter(Boolean).map(line => JSON.parse(line)).find(frame => frame.id === id);
+      expect(frame.ok, JSON.stringify(frame)).toBe(true);
+    };
+    let providerPid: number | undefined;
+    try {
+      send(1, "initialize", { agent: "codex", model: "gpt-5.6-sol" }); await response(1);
+      send(2, "session.open", { agent: "codex", model: "gpt-5.6-sol", runtimeDirectory: root,
+        workingDirectory: root, normalizedSessionId: "blocked-output-session", permissionMode: "deny-all",
+        systemInstructions: "Generate synthetic local output.", tools: [] }); await response(2);
+      providerPid = Number(readFileSync(join(root, "provider-pid"), "utf8"));
+      send(3, "run.attach", { runId: "blocked-output-run", catalogRevision: 1, tools: [] }); await response(3);
+      child.stdout.pause();
+      send(4, "turn.start", { turnId: "blocked-output-turn", message: "Fill the blocked pipe." });
+      await vi.waitFor(() => expect(existsSync(join(root, "provider-cleanup.json")), stderr).toBe(true), { timeout: 8000 });
+      const cleanup = JSON.parse(readFileSync(join(root, "provider-cleanup.json"), "utf8"));
+      expect(cleanup).toMatchObject({ reason: "ACPX sidecar output buffer limit exceeded", pid: providerPid,
+        closeCount: 1, code: 0, signal: null });
+      expect(cleanup.bufferedBytes).toBeGreaterThan(3 * ACPX_SIDECAR_MAX_FRAME_BYTES);
+      expect(cleanup.bufferedBytes).toBeLessThanOrEqual(4 * ACPX_SIDECAR_MAX_FRAME_BYTES);
+      expect(() => process.kill(providerPid!, 0)).toThrow();
+      expect(child.exitCode).toBeNull();
+      expect(stderr).toContain("output_buffer_limit_exceeded");
+      child.stdout.resume();
+      expect(await exited).toEqual([1, null]);
+      const events = stdout.trim().split("\n").map(line => JSON.parse(line)).filter(frame => frame.sequence);
+      expect(events.length).toBeGreaterThan(256);
+      expect(events.map(frame => frame.sequence)).toEqual(events.map((_frame, index) => index + 1));
+      expect(events.some(frame => frame.eventType === "runtime.turn_terminal" && frame.payload.status === "completed")).toBe(false);
+    } finally {
+      child.stdout.resume();
+      child.stdin.end();
+      if (providerPid && !existsSync(join(root, "provider-cleanup.json"))) { try { process.kill(providerPid, "SIGKILL"); } catch {} }
+      if (child.exitCode === null) child.kill("SIGKILL");
+      await exited.catch(() => undefined);
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15_000);
 
 
   it.each(["success", "accepted-false", "error", "cancel", "timeout", "receiver-rejected"])(

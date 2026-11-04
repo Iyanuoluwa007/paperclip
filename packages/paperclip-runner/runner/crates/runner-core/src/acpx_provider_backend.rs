@@ -1144,7 +1144,7 @@ impl AcpxCommandExecutor {
                     "status": "failed",
                     "turnTerminalState": "failed",
                     "runTerminalState": "failed",
-                    "reportedWorkDisposition": "unknown",
+                    "reportedWorkDisposition": "needs_review",
                     "provider": "acpx",
                 }),
             })?;
@@ -2310,7 +2310,7 @@ impl AcpxCommandExecutor {
                                 "code":"acpx_provider_transport_failed","message":message,
                                 "error":{"code":"acpx_provider_transport_failed","message":message,"recoverable":false}}) })?;
                         state.push(NormalizedProviderEvent { event_type: "run.terminal".to_owned(), priority: EventPriority::P0,
-                            payload: json!({"schema":"paperclip.prp.terminal.v1","status":"failed","turnTerminalState":"failed","runTerminalState":"failed","reportedWorkDisposition":"unknown","provider":"acpx"}) })?;
+                            payload: json!({"schema":"paperclip.prp.terminal.v1","status":"failed","turnTerminalState":"failed","runTerminalState":"failed","reportedWorkDisposition":"needs_review","provider":"acpx"}) })?;
                     }
                     self.context.provider_turn_id = None;
                     // A failed transport cannot attest escaped provider cleanup.
@@ -4895,6 +4895,7 @@ mod tests {
         assert_eq!(events[2].event_type, "run.terminal");
         assert_eq!(events[2].payload["schema"], "paperclip.prp.terminal.v1");
         assert_eq!(events[2].payload["turnTerminalState"], "failed");
+        assert_eq!(events[2].payload["reportedWorkDisposition"], "needs_review");
         assert_eq!(recovered.poll_events().unwrap(), events);
         let cleanup_error = recovered
             .shutdown()

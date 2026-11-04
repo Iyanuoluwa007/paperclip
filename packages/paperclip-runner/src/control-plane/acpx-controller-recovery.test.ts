@@ -86,7 +86,7 @@ it("preserves a startup provider failure through the real sidecar transport and 
       result: { result: { providerFailure } } });
     expect(run.launches()).toHaveLength(1);
   } finally { await run.cleanup(); }
-}, 20_000);
+}, 60_000);
 
 async function fixture(maxLifetimeMs?: number, candidateAdmission?: AcpxCandidateStartupAdmission, beforeLaunchDelayMs = 0, reconnectGraceMs = 15_000) {
   const root = mkdtempSync(resolve(tmpdir(), "acpx-controller-recovery-"));
@@ -153,7 +153,7 @@ async function fixture(maxLifetimeMs?: number, candidateAdmission?: AcpxCandidat
         expect(child.exitCode,"runner exit; "+diagnostics).toBeNull();
         expect(child.signalCode,"runner signal; "+diagnostics).toBeNull();
         expect(["completed","failed"]).toContain(controller.getCommand(id)?.status);
-      },{timeout:8000});
+      },{timeout:type === "session.open" ? 35_000 : 8000});
     } catch (error) {
       let runnerDiagnostics: unknown;
       try { runnerDiagnostics = JSON.parse(readFileSync(resolve(root, "runner/runner-state.json"), "utf8")).diagnostics?.slice(-8); } catch { /* Startup may not have created state. */ }
@@ -216,9 +216,9 @@ async function fixture(maxLifetimeMs?: number, candidateAdmission?: AcpxCandidat
 }
 
 async function assertActiveExpiry(candidate = false) {
-  // One fixed grant covers the six-second cold delay, four existing eight-
-  // second command budgets, and seven seconds of active-turn headroom. Loaded
-  // CI exhausted the earlier fifteen-second grant before session.open settled.
+  // One fixed grant covers the six-second cold delay, the native thirty-second
+  // startup bound, and active-turn headroom. The fixture must not time out
+  // session.open before the provider admission deadline it exercises.
   // Never renew this authority after setup or the active-turn witness.
   const lifetimeMs = 45_000;
   const candidateAdmission = candidate ? bindAcpxCandidateAdmission({ schema: "paperclip.acpx-candidate-admission.v1", companyId: "company-expiry",
@@ -276,7 +276,7 @@ it("keeps the original native ACPX process and active turn through controller re
     writeFileSync(resolve(run.root,"action"),"complete");
     await vi.waitFor(()=>expect(run.controller().store.state.committedEvents.some(event=>event.eventType==="turn.completed")).toBe(true),{timeout:5000});
   }finally{await run.cleanup();}
-},20000);
+},60000);
 
 it("adopts the live ACPX execution through the production native transport",async()=>{
   const run=await fixture();
@@ -317,7 +317,7 @@ it("adopts the live ACPX execution through the production native transport",asyn
     await adopted?.transport.close().catch(()=>undefined);
     await run.cleanup();
   }
-},25000);
+},60000);
 
 it("recovers a turn that completed while its controller was offline",async()=>{
   const run=await fixture();
@@ -334,7 +334,7 @@ it("recovers a turn that completed while its controller was offline",async()=>{
     expect(run.launches()).toHaveLength(1);
     expect(()=>process.kill(pid,0)).not.toThrow();
   }finally{await run.cleanup();}
-},20000);
+},60000);
 
 it("durably drains noisy active output and one offline terminal before its controller returns", async () => {
   const run = await fixture(undefined, undefined, 0, 60_000);
@@ -359,7 +359,7 @@ it("durably drains noisy active output and one offline terminal before its contr
     expect(run.launches()).toHaveLength(1);
     expect(readFileSync(resolve(run.root, "commands.jsonl"), "utf8").split("\n").filter(command => command === "turn.start")).toHaveLength(1);
   } finally { await run.cleanup(); }
-}, 45_000);
+}, 90_000);
 
 it("remains silent at an offline approval and resolves the original request exactly once after adoption", async () => {
   const run = await fixture();
@@ -389,7 +389,7 @@ it("remains silent at an offline approval and resolves the original request exac
     await vi.waitFor(() => expect(run.controller().store.state.committedEvents.filter(event => event.eventType === "turn.completed")).toHaveLength(1), { timeout: 5000 });
     expect(run.launches()).toHaveLength(1);
   } finally { await run.cleanup(); }
-}, 25_000);
+}, 60_000);
 
 it("distinguishes a provider-process crash from controller replacement",async()=>{
   const run=await fixture();
@@ -416,9 +416,10 @@ it("distinguishes a provider-process crash from controller replacement",async()=
       code:"command_execution_failed", message:"ACPX request snapshot requires the surviving provider",
     }}});
     await vi.waitFor(() => expect(run.controller().store.state.committedEvents.filter(event => event.eventType === "turn.failed")).toHaveLength(1), { timeout: 5000 });
+    await vi.waitFor(() => expect(run.controller().store.state.committedEvents.find(event => event.eventType === "run.terminal")?.envelope).toMatchObject({ payload: { payload: { reportedWorkDisposition: "needs_review" } } }), { timeout: 5000 });
     expect(run.launches()).toHaveLength(1);
   }finally{await run.cleanup();}
-},20000);
+},60000);
 
 it("requires a surviving provider when requesting a live snapshot after explicit close",async()=>{
   const run=await fixture();
@@ -432,4 +433,4 @@ it("requires a surviving provider when requesting a live snapshot after explicit
     expect(result).toMatchObject({status:"failed",result:{result:{message:"ACPX request snapshot requires the surviving provider"}}});
     expect(run.launches()).toHaveLength(1);
   }finally{await run.cleanup();}
-},20000);
+},60000);

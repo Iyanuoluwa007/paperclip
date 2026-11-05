@@ -4,12 +4,13 @@ import { setTimeout as delay } from "node:timers/promises";
 import { environmentTaskOperationSchema, environmentTaskResultSchema, type PluginEnvironmentTaskOperation, type PluginEnvironmentTaskResult, type PluginEnvironmentTaskCredential } from "@paperclipai/plugin-sdk";
 import type { RunnerIngressEndpoint } from "@paperclipai/adapter-utils/runner-connectivity";
 import { RUNNER_PRP_PROTOCOL_MIN, RUNNER_PRP_PROTOCOL_MAX, type RunnerProcessHandle, type RunnerProcessLaunchSpec,
-  type DurablePrpControlPlane, type RunnerExecutionDriver, type RunnerLaunchPreparer, type DurableRecoveryIdentity } from "../../vendor/paperclip-runner/index.js";
+  inspectWarmRunTransition, type DurablePrpControlPlane, type RunnerExecutionDriver, type RunnerLaunchPreparer, type DurableRecoveryIdentity } from "../../vendor/paperclip-runner/index.js";
 import { connectRunnerPrpIngress } from "../../realtime/runner-prp-outbound.js";
 import type { NativeExecutionContext } from "./native-execution-context.js";
 
 export async function verifyPluginRunnerTaskReattachment(
   task: (operation: unknown) => Promise<unknown>, identity: unknown,
+  transition?: { authority: DurablePrpControlPlane; sourceIdentity: DurableRecoveryIdentity; runnerArtifact: { version: string; digest: string } },
 ): Promise<void> {
   const operation = environmentTaskOperationSchema.parse({ kind: "read_state", identity });
   if (operation.kind !== "read_state") throw new Error("Plugin Runner recovery identity unavailable");
@@ -18,9 +19,16 @@ export async function verifyPluginRunnerTaskReattachment(
     throw new Error("Plugin Runner is not running");
   }
   const result = environmentTaskResultSchema.parse(await task(operation));
-  if (result.kind !== "state" || result.state.schema !== "paperclip.runner.durable.state.v1"
-    || Object.entries(operation.identity).some(([key, value]) => result.state[key] !== value)) {
-    throw new Error("Plugin Runner adoption identity mismatch");
+  const deny = (): never => { throw new Error("Plugin Runner adoption identity mismatch"); };
+  if (result.kind !== "state" || Object.entries(operation.identity).some(([key, value]) => result.state[key] !== value)) return deny();
+  if (result.state.schema !== "paperclip.runner.durable.state.v1") {
+    if (!transition) return deny();
+    const proof = inspectWarmRunTransition({ controlPlaneState: transition.authority.store.state,
+      runnerState: result.state, expectedNewIdentity: operation.identity,
+      expectedRunnerVersion: transition.runnerArtifact.version, expectedRunnerDigest: transition.runnerArtifact.digest });
+    if (!proof || Object.entries(transition.sourceIdentity).some(([key, value]) => proof.receipt.oldIdentity[key as keyof DurableRecoveryIdentity] !== value) ||
+        Object.entries(operation.identity).some(([key, value]) => proof.runnerIdentity[key as keyof DurableRecoveryIdentity] !== value ||
+          proof.receipt.newIdentity[key as keyof DurableRecoveryIdentity] !== value)) return deny();
   }
 }
 
@@ -47,6 +55,7 @@ export function createPluginRunnerTaskOwner(input: {
   warmTaskVersion?: 1;
   githubBroker?: { url: string; token: string };
   adoptIdentity?: DurableRecoveryIdentity;
+  runnerArtifact?: { version: string; digest: string };
 }) {
   if (input.recoveryPurpose && (input.sourceRecoveryVersion !== 1 || !input.resumeFrom || !input.priorIdentity || !input.accountIdentity ||
       input.harness !== "codex" || input.adoptIdentity && Object.entries(input.priorIdentity!).some(([key, value]) =>
@@ -269,7 +278,9 @@ export function createPluginRunnerTaskOwner(input: {
     });
     return { child, completion, restart: null };
   };
-  const registration = async (authority: DurablePrpControlPlane, runId: string, signal?: AbortSignal) => {
+  const registration = async (authority: DurablePrpControlPlane, runId: string, signal?: AbortSignal,
+    registeredIdentity?: DurableRecoveryIdentity) => {
+    const adoptionIdentity = input.adoptIdentity ? structuredClone(registeredIdentity ?? input.adoptIdentity) : undefined;
     const generation = ++registrationGeneration;
     let registrationReleased = false;
     let outbound: ReturnType<typeof connectRunnerPrpIngress> | null = null;
@@ -284,8 +295,10 @@ export function createPluginRunnerTaskOwner(input: {
       startupFailureCode: "runner_ingress_unavailable" as const,
       activate: () => {
         activation = (async () => {
-          if (input.adoptIdentity) {
-            await verifyPluginRunnerTaskReattachment(input.task, input.adoptIdentity);
+          if (adoptionIdentity) {
+            await verifyPluginRunnerTaskReattachment(input.task, adoptionIdentity, input.runnerArtifact && input.adoptIdentity ? {
+              authority, sourceIdentity: input.adoptIdentity, runnerArtifact: input.runnerArtifact,
+            } : undefined);
           } else await running;
           if (registrationReleased || signal?.aborted) throw new Error("Plugin Runner startup cancelled");
           const ingress = await endpoint();
@@ -340,7 +353,7 @@ export function createPluginRunnerTaskOwner(input: {
       if (result.kind !== "state") throw new Error("Plugin Runner archived state unavailable");
       return result.state;
     },
-    controlPlaneRegistration: (authority, identity, signal) => registration(authority, identity?.runId ?? "", signal),
+    controlPlaneRegistration: (authority, identity, signal) => registration(authority, identity?.runId ?? "", signal, identity),
     ...(input.adoptIdentity ? { adoptExistingRunner: {
       // Provider ownership is attested by Launcher, never by a controller-local PID.
       pid: null, processGroupId: null, startedAt: null,

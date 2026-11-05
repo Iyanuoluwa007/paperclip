@@ -13410,6 +13410,7 @@ async function createRunnerdBackendWithinSessionClaim(
         credentials.accountIdentity, input.managedAiCredentialWriteback);
     }
     const ownerInput: Parameters<typeof createPluginRunnerTaskOwner>[0] = { ...credentials,
+      runnerArtifact: input.stoppedSourceRecovery?.runnerArtifact ?? input.controllerPersistence?.runnerArtifact ?? description.runner,
       executionContext: input.executionContext?.pluginSupported ? input.executionContext : undefined,
       // Warm retirement can outlive the run's temporary credential home; complete uses the durable handoff.
       onCredentials: input.execution.session.lifecyclePolicy.mode === "warm" ? undefined : credentials.onCredentials,

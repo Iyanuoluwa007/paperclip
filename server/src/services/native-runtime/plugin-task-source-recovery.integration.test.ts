@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import WebSocket from "ws";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
@@ -19,7 +19,7 @@ import { remoteTerminationReceipt } from "../remote-execution-termination.js";
 import { NativeExecutionContext } from "./native-execution-context.js";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { claimNativeRestartRecoveries, currentNativeControllerIdentity } from "./native-restart-recovery.js";
-import { loadNativeRunnerCheckpoint, nativeRunnerCheckpointWriter } from "./native-runner-checkpoint.js";
+import { loadNativeRunnerCheckpoint, nativeRunnerCheckpointWriter, restoreNativeRunnerCheckpoint } from "./native-runner-checkpoint.js";
 import { claimPluginTaskSourceRecovery } from "./plugin-task-source-recovery.js";
 import { prepareNativeHeartbeatRun } from "./prepare-native-run.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
@@ -28,7 +28,7 @@ import { createStoppedSourceExecutionContext, inspectStoppedPluginSourceRecovery
 import { nativeSha256 } from "./canonical.js";
 import { registerLocalRuntimeApiServer } from "../../runtime-api.js";
 import * as pluginRunner from "./plugin-runner-task.js";
-import { closeWarmNativeSessionsForEnvironment, executePaperclipNativeSession, nativeControllerMigrationDescriptor } from "./native-session-executor.js";
+import { closeWarmNativeSessionsForEnvironment, createRunnerdBackend, executePaperclipNativeSession, nativeControllerMigrationDescriptor } from "./native-session-executor.js";
 import { nativeToolContractFingerprintForTarget } from "./native-session-resume.js";
 import { createRunnerdCodexTransport as createCapabilityRunnerdCodexTransport, createNativeSessionBackend, defaultCapabilityRunnerdBinary,
   bindRunnerLaunchResources, createRunnerProviderLaunch, runnerLaunchRequirementsDigest, type RunnerProviderLaunchRequirements, type RunnerProcessLaunchSpec } from "@paperclipai/paperclip-runner";
@@ -160,7 +160,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("stopped source admission un
       matchesExecution: (previous, digest) => digest === `sha256:${"c".repeat(64)}` && f.matchesExecution(previous), ...overrides });
   }
 
-  it.skipIf(!existsSync(defaultCapabilityRunnerdBinary()) || !existsSync(fakeCodex))("executes the next run through Core after abrupt idle process loss", async () => {
+  it.skipIf(!existsSync(defaultCapabilityRunnerdBinary()) || !existsSync(fakeCodex)).each([false, true])("executes the next run through Core after abrupt idle process loss (restart=%s)", async restart => {
     const f = await fixture(true, root), binary = defaultCapabilityRunnerdBinary();
     await db.update(agents).set({ lifecycleRequiredPluginIds: [f.pluginId] }).where(eq(agents.id, f.agentId));
     const [plugin] = await db.select().from(plugins).where(eq(plugins.id, f.pluginId));
@@ -249,7 +249,10 @@ describe.skipIf(!recoveryPostgresSupport.supported)("stopped source admission un
             endpoint = `ws://127.0.0.1:${port}/api/runner/v1/connect/${f.sourceRunId}`; await new Promise(resolve => setTimeout(resolve, 75));
             return { kind: "accepted", taskId };
           }
-          case "read_state": return { kind: "state", taskId, state: JSON.parse(await readFile(join(physicalRoot, "runner", "runner-state.json"), "utf8")) };
+          case "read_state": {
+            const state = JSON.parse(await readFile(join(physicalRoot, "runner", "runner-state.json"), "utf8"));
+            return { kind: "state", taskId, state };
+          }
           case "status": return { kind: "status", taskId, phase: hostStopped ? "cancelled" : child?.exitCode != null ? "failed" : "running", executionStopped: hostStopped || child?.exitCode != null, sessionStateAvailable: false };
           case "connection": return { kind: "connection", taskId, endpoint: { kind: "authenticated_websocket", websocketUrl: "wss://runner.example.test/runner", generation: "fixture", secretHeaders: [] } };
           case "stop": kill(child?.pid ?? null); hostStopped = true; return { kind: "accepted", taskId };
@@ -257,14 +260,38 @@ describe.skipIf(!recoveryPostgresSupport.supported)("stopped source admission un
           default: throw new Error(`Unexpected fake host operation ${op.kind}`);
         } } finally { args[5]?.(); }
       });
-      const result = await executePaperclipNativeSession({ db, execution: f.execution, runnerInstanceId: f.identity.runnerInstanceId,
-        leaseOwner: f.owner.leaseOwner, useRunnerd: true, runnerIngressAuthorized: true,
+      const target = { kind: "remote" as const, transport: "sandbox" as const, providerKey: "plugin", environmentId: f.environmentId,
+        leaseId: f.leaseId, remoteCwd: root, sandboxLeaseAcquisition: { outcome: "created" as const, providerLeaseId: "replacement-task" },
+        runnerTask: (operation: unknown, context?: { executionContext?: unknown }) => executeEnvironmentTask(db, f.workers as unknown as PluginWorkerManager,
+          { companyId: f.companyId, leaseId: f.leaseId, operation: operation as never, executionContext: context?.executionContext }) };
+      const execution = { db, execution: f.execution, runnerInstanceId: f.identity.runnerInstanceId,
         managedAiCredentialIdentity: "synthetic-credential", managedAiAccountIdentity: f.accountIdentity, managedAiCredentialHome: credentialHome,
-        runnerExecutionTarget: { kind: "remote", transport: "sandbox", providerKey: "plugin", environmentId: f.environmentId, leaseId: f.leaseId, remoteCwd: root,
-          sandboxLeaseAcquisition: { outcome: "created", providerLeaseId: "replacement-task" },
-          runnerTask: (operation, context) => executeEnvironmentTask(db, f.workers as unknown as PluginWorkerManager,
-            { companyId: f.companyId, leaseId: f.leaseId, operation: operation as never, executionContext: context?.executionContext as NativeExecutionContext | undefined }) },
-      });
+        runnerExecutionTarget: target, runnerIngressAuthorized: true as const };
+      let recovery: Extract<Awaited<ReturnType<typeof claimNativeRestartRecoveries>>[number], { kind: "reattach_remote_runner" }> | undefined;
+      if (restart) {
+        await restoreNativeRunnerCheckpoint(db, sourceExecution.binding, descriptor.root);
+        const source = await inspectStoppedPluginSourceRecovery({ db, execution: f.execution, target,
+          description: { ...description, runner: artifact, warmTaskVersion: 1 },
+          readControlState: () => JSON.parse(readFileSync(join(descriptor.root, "control-plane", "control-plane-state.json"), "utf8")),
+          matchesExecution: (previous, digest) => digest === descriptor.configDigest && f.matchesExecution(previous) });
+        expect(source).toBeDefined(); f.context.pluginSupported = true;
+        await claimPluginTaskSourceRecovery(db, f);
+        const backend = await createRunnerdBackend({ ...execution, executionContext: f.context,
+          stoppedSourceRecovery: source, pluginTaskDescription: { ...description, runner: artifact, warmTaskVersion: 1 },
+          controllerPersistence: { bootId: f.owner.bootId, runnerArtifact: artifact } });
+        const admitted = await backend.recoverSession!(snapshot, { signal: f.context.signal });
+        expect(admitted.recovered).toBe(true);
+        if (!admitted.recovered) throw new Error("source fixture admission failed");
+        await admitted.session!.detachControllerForRestart!(); f.context.finish();
+        const pid = child!.pid; expect(pid).toBeDefined(); expect(await calls("turn/start")).toBe(1);
+        await db.update(nativeRunFinalizations).set({ leaseExpiresAt: new Date(Date.now() - 1_000) }).where(eq(nativeRunFinalizations.runId, f.runId));
+        const [claimed] = await claimNativeRestartRecoveries({ db, restartKind: "hard", runIds: [f.runId] });
+        expect(claimed).toMatchObject({ kind: "reattach_remote_runner", sourceReconciliation: true });
+        if (claimed.kind !== "reattach_remote_runner") throw new Error("source fixture restart was not claimed");
+        recovery = claimed; expect(child!.pid).toBe(pid);
+      }
+      const result = await executePaperclipNativeSession({ ...execution, useRunnerd: true,
+        leaseOwner: recovery?.leaseOwner ?? f.owner.leaseOwner, ...(recovery ? { restartRecovery: recovery } : {}) });
       completed = true;
       expect(result.exitCode).toBe(0); expect(result.sessionDisplayId).toBe(snapshot.providerSessionId);
       expect(await calls("turn/start")).toBe(2); expect(launchCount).toBe(1);

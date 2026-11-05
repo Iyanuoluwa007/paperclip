@@ -160,6 +160,47 @@ describe("plugin native Runner ownership", () => {
     expect(close).toHaveBeenCalledOnce();
     expect(task.mock.calls.map(([op]) => op.kind)).toEqual(["status", "read_state", "connection", "status"]);
   });
+  it.each(["unknown-schema", "unproven-transition"])("rejects matching target IDs without a native transition proof: %s", async mode => {
+    const { task } = provider(), perform = task.getMockImplementation()!;
+    const target = { ...requirements.identity, runId: "next-run", turnId: "next-turn", itemId: "next-item" };
+    task.mockImplementation(async op => {
+      const result = await perform(op) as any;
+      if (op.kind === "read_state") result.state = { ...result.state, ...target,
+        schema: mode === "unknown-schema" ? "unknown" : "paperclip.runner.durable.state.warm-transition.v1", warmTransition: {} };
+      return result;
+    });
+    ingress.connect.mockClear();
+    const owner = createPluginRunnerTaskOwner({ task, projectIds: [], harness: "codex", adoptIdentity: requirements.identity,
+      runnerArtifact: { version: "fixture", digest: `sha256:${"a".repeat(64)}` } });
+    const next = await owner.driver.controlPlaneRegistration!({ store: { state: {} } } as never, target);
+    next.activate?.(); await expect(next.ready!()).rejects.toThrow("adoption identity mismatch");
+    expect(ingress.connect).not.toHaveBeenCalled(); await next.release("detach");
+  });
+
+  it.each(["matching", "old-source", "foreign-lease"])("verifies the identity for each adopted registration: %s", async mode => {
+    const { task } = provider(), perform = task.getMockImplementation()!;
+    const target = { ...requirements.identity, runId: "next-run", turnId: "next-turn", itemId: "next-item" };
+    let actual = requirements.identity;
+    task.mockImplementation(async op => {
+      const result = await perform(op) as any;
+      if (op.kind === "read_state") result.state = { ...result.state, ...actual };
+      return result;
+    });
+    ingress.connect.mockClear(); ingress.connect.mockReturnValue({ ready: Promise.resolve(), close: vi.fn(async () => {}) });
+    const owner = createPluginRunnerTaskOwner({ task, projectIds: [], harness: "codex", adoptIdentity: requirements.identity });
+    const first = await owner.driver.controlPlaneRegistration!({} as never, requirements.identity);
+    first.activate?.(); await first.ready?.();
+    actual = mode === "old-source" ? requirements.identity : mode === "foreign-lease" ? { ...target, environmentLeaseId: "foreign" } : target;
+    const next = await owner.driver.controlPlaneRegistration!({} as never, target);
+    next.activate?.();
+    if (mode === "matching") await expect(next.ready!()).resolves.toBeUndefined();
+    else await expect(next.ready!()).rejects.toThrow("adoption identity mismatch");
+    expect(task.mock.calls.filter(([op]) => op.kind === "read_state").at(-1)![0].identity).toEqual(target);
+    expect(ingress.connect).toHaveBeenCalledTimes(mode === "matching" ? 2 : 1);
+    await first.release(); await next.release("detach");
+    expect(task.mock.calls.some(([op]) => ["submit", "stop", "complete"].includes(op.kind))).toBe(false);
+  });
+
   it.each(["stopped", "wrong-identity", "revoked", "cancelled"])("refuses adoption when the saved task is %s", async mode => {
     const { task } = provider();
     const perform = task.getMockImplementation()!;

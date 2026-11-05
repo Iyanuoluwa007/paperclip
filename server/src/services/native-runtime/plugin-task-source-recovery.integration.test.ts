@@ -15,6 +15,7 @@ import { DurablePrpControlPlane, type DurablePrpCheckpoint, type NativeExecution
 import { recoveryPostgresSupport, startRecoveryPostgres } from "../../__tests__/helpers/recovery-postgres.js";
 import { createIsolatedTestHome } from "../../__tests__/helpers/isolated-test-home.js";
 import { executeEnvironmentTask, resolvePluginTaskResume } from "../environment-task-runtime.js";
+import * as taskResume from "../plugin-task-resume.js";
 import type { PluginWorkerManager } from "../plugin-worker-manager.js";
 import { remoteTerminationReceipt } from "../remote-execution-termination.js";
 import { NativeExecutionContext } from "./native-execution-context.js";
@@ -416,6 +417,40 @@ describe.skipIf(!recoveryPostgresSupport.supported)("stopped source admission un
     const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.sourceLeaseId));
     expect(lease.metadata?.runnerTaskSourceConsumer).toBeUndefined(); expect(f.workers.call).not.toHaveBeenCalled();
     expect(await discovery(f, { description: { ...description, sourceRecoveryVersion: undefined } })).toBeUndefined();
+  });
+
+  it("prefers ordinary retained suspension on a fresh physical lease before source-only gates", async () => {
+    const f = await fixture(true);
+    const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+    const snapshot = { ...f.snapshot, goal: { status: "active" } } as PersistedNativeSession;
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { ...source.runnerProfileJson, sessionCheckpoint: snapshot,
+      nativeControllerRecovery: createNativeControllerRecovery(snapshot, { configDigest: `sha256:${"c".repeat(64)}`, processConfigDigest: null },
+        { runId: f.sourceRunId, runnerInstanceId: f.identity.runnerInstanceId, normalizedSessionId: f.identity.normalizedSessionId }) } })
+      .where(eq(heartbeatRuns.id, f.sourceRunId));
+    await db.update(environmentLeases).set({ metadata: sql`${environmentLeases.metadata} || '{"runnerTaskSessionRetained":true}'::jsonb` })
+      .where(eq(environmentLeases.id, f.sourceLeaseId));
+    expect(await resolvePluginTaskResume(db, { ...f, priorIdentity: f.identity })).toBe(f.resumeFrom);
+    const inspect = vi.fn(() => { throw new Error("ordinary continuation must not inspect a source-only launch"); });
+    await expect(discovery(f, { matchesExecution: () => false, readControlState: inspect })).resolves.toBeUndefined();
+    expect(inspect).not.toHaveBeenCalled(); expect(f.workers.call).not.toHaveBeenCalled();
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
+    expect(lease.metadata?.runnerTaskSourceRecovery).toBeUndefined();
+  });
+
+  it("propagates ordinary continuation inspection errors", async () => {
+    const f = await fixture(true), failure = new Error("database lookup unavailable");
+    const resolver = vi.spyOn(taskResume, "resolvePluginTaskResume").mockRejectedValue(failure);
+    try { await expect(discovery(f)).rejects.toBe(failure); }
+    finally { resolver.mockRestore(); }
+    expect(f.workers.call).not.toHaveBeenCalled();
+  });
+
+  it("keeps an existing predecessor claim sticky when retained availability later appears", async () => {
+    const f = await fixture(true); await claimPluginTaskSourceRecovery(db, f);
+    await db.update(environmentLeases).set({ metadata: sql`${environmentLeases.metadata} || '{"runnerTaskSessionRetained":true}'::jsonb` })
+      .where(eq(environmentLeases.id, f.sourceLeaseId));
+    await expect(discovery(f)).resolves.toMatchObject({ identity: f.identity, resumeFrom: f.resumeFrom });
+    expect(f.workers.call).not.toHaveBeenCalled();
   });
 
   it.each(["goal", "requests", "transition", "context-capability", "artifact", "configuration"])("refuses unsafe source discovery: %s", async mode => {

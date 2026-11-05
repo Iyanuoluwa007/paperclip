@@ -98,6 +98,11 @@ run ID alone never grants recovery. Both operations must name the same `resumeFr
 Preparation must save this source binding with its new configuration. Submission
 must verify the same binding before it starts the source process.
 
+An already authorized retained suspension uses ordinary continuation, including
+when the next lease has a fresh physical task. The stopped-source extension is
+for a completed provider session; prepared-only state keeps existing cleanup
+and suspension behavior.
+
 Core requires the source run to have a committed successful result, an encrypted
 PRP journal, confirmed physical termination, and no other source consumer. Core
 claims the source under the current native controller lease. This does not change

@@ -97,6 +97,15 @@ export async function inspectStoppedPluginSourceRecovery(input: {
   if (recovered.kind !== "recoverable") return deny();
   const header = recovered.checkpoint.records.get("header"), identity = header ? inspectDurablePrpCheckpointHeader(header) : null;
   if (!identity || identity.runId === execution.binding.runId) return deny();
+  if (!pending) {
+    try {
+      await resolvePluginTaskResume(input.db, { companyId: execution.binding.companyId,
+        leaseId: target.leaseId, priorIdentity: identity });
+      return; // A retained suspension already has ordinary continuation authority.
+    } catch (error) {
+      if (!(error instanceof Error) || error.message !== "Plugin Runner retained session is not authorized") throw error;
+    }
+  }
   const [source] = await input.db.select().from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, execution.binding.companyId), eq(heartbeatRuns.id, identity.runId)));
   if (!source || source.status !== "succeeded") return deny();

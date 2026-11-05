@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DurablePrpControlPlane } from "../control-plane/durable-prp-control-plane.js";
-import { createRunnerProviderLaunch, preparedRunnerLaunchWorkingDirectory, runnerLaunchRequirementsDigest, validatePreparedRunnerLaunch,
+import { createRunnerProviderLaunch, preparedRunnerLaunchWorkingDirectory, runnerLaunchRequirementsDigest, runnerLaunchSettingsMatch, validatePreparedRunnerLaunch,
   inspectSourceReconciliationLaunchRequirements, runnerProviderLaunchRequirements, type RunnerProviderLaunchEnvironment, type RunnerProviderLaunchRequirements } from "./runner-provider-launch.js";
 
 const requirements: RunnerProviderLaunchRequirements = {
@@ -60,6 +60,14 @@ describe("built-in provider launch preparation", () => {
       expect(inspectSourceReconciliationLaunchRequirements(core.store.state, expected)).toBeNull();
     } finally { await core.stop(); rmSync(root, { recursive: true, force: true }); }
   });
+  it("compares effective ACPX defaults without changing the saved requirements", () => {
+    const frozen = { ...requirements, provider: "acpx" as const, model: "gpt-5.4", settings: {} };
+    expect(runnerLaunchSettingsMatch(frozen, { acpxAgent: "codex", acpxPermissionMode: "approve-all", acpxPermissionModePinned: true })).toBe(true);
+    expect(runnerLaunchSettingsMatch(frozen, { acpxPermissionMode: "approve-reads" })).toBe(false);
+    expect(runnerLaunchSettingsMatch(frozen, { acpxPermissionModePinned: false })).toBe(false);
+    expect(frozen.settings).toEqual({});
+  });
+
   it("preserves probe project-instruction suppression through a prepared launch", () => {
     const selected = runnerProviderLaunchRequirements({ provider: "codex", disableCodexProjectInstructions: true,
       disableCodexWebSearch: true }, requirements.identity,

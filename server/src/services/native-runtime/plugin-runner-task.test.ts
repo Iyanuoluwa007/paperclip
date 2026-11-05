@@ -59,7 +59,7 @@ describe("plugin native Runner ownership", () => {
     expect(() => createPluginRunnerTaskOwner({ task, projectIds: [], harness: mode === "provider" ? "claude" : "codex",
       recoveryPurpose: "source_reconcile", sourceRecoveryVersion: mode === "capability" ? undefined : 1,
       resumeFrom: mode === "source" ? undefined : "source-task", priorIdentity: mode === "identity" ? undefined : requirements.identity,
-      accountIdentity: mode === "account" ? undefined : "selected-account", ...(mode === "adoption" ? { adoptIdentity: requirements.identity } : {}),
+      accountIdentity: mode === "account" ? undefined : "selected-account", ...(mode === "adoption" ? { adoptIdentity: { ...requirements.identity, runId: "foreign" } } : {}),
     })).toThrow("source reconciliation unavailable");
     expect(task).not.toHaveBeenCalled();
   });
@@ -82,6 +82,19 @@ describe("plugin native Runner ownership", () => {
       expect(attached).toMatchObject({ priorIdentity: requirements.identity, requirements: { identity: { runId: "next" } } });
       expect(attached).not.toHaveProperty("recoveryPurpose"); expect(attached).not.toHaveProperty("resumeFrom");
     } finally { await registration.release("detach"); }
+  });
+  it("reauthorizes an adopted source through fresh source preparation before preparing its target", async () => {
+    const { task } = provider();
+    const owner = createPluginRunnerTaskOwner({ task, projectIds: [], harness: "codex", projectAuthCheckVersion: 1,
+      recoveryPurpose: "source_reconcile", sourceRecoveryVersion: 1, resumeFrom: "source-task", priorIdentity: requirements.identity,
+      adoptIdentity: requirements.identity, accountIdentity: "selected-account" });
+    await prepare(owner); await prepare(owner);
+    const source = task.mock.calls.map(([op]) => op).filter(op => op.kind === "prepare");
+    expect(source).toHaveLength(2);
+    expect(source.every(op => op.recoveryPurpose === "source_reconcile" && op.resumeFrom === "source-task" && !op.priorIdentity)).toBe(true);
+    await prepare(owner, { ...requirements, identity: { ...requirements.identity, runId: "next", turnId: "next-turn", itemId: "next-item" } });
+    expect(task.mock.calls.map(([op]) => op).filter(op => op.kind === "prepare").at(-1)).toMatchObject({ priorIdentity: requirements.identity });
+    expect(task.mock.calls.some(([op]) => op.kind === "submit")).toBe(false);
   });
   it.each(["finish", "rebind"])("does not send startup Stop after the context %s", mode => {
     const context = new NativeExecutionContext({ binding: { companyId: "company", agentId: "agent", runId: "run" } } as never, 1_000);

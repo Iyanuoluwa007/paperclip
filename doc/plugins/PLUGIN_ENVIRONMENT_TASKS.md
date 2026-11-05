@@ -102,6 +102,16 @@ journal after this claim. Workspace export and settlement holds still apply.
 After source submission, the same current owner can prepare its attachment with
 the exact source as `priorIdentity`. This does not grant ordinary warm reuse.
 
+Core restores the source journal after it claims the consumer lease, so an old
+controller's final cleanup write cannot leave a stale local cut. Fresh source
+preparation uses the frozen source instructions and current account authority.
+It does not replace the old source's preparation cache. The existing session
+attachment admits the current run only after source reconciliation completes.
+A controller restart before attachment follows that same saved source claim.
+Once the current run has its own journal, recovery must use that authority.
+An unproven or stopped pending incarnation stays held for exact task recovery;
+it cannot select an earlier ancestor as a fresh source.
+
 The provider must verify the original account, workspace, runtime, and source
 ownership before launch. The native Runner must reject active goals, pending
 tools, ambiguous starts, and uncertain work before it restores the provider.

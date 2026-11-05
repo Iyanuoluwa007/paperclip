@@ -49,13 +49,15 @@ export function createPluginRunnerTaskOwner(input: {
   adoptIdentity?: DurableRecoveryIdentity;
 }) {
   if (input.recoveryPurpose && (input.sourceRecoveryVersion !== 1 || !input.resumeFrom || !input.priorIdentity || !input.accountIdentity ||
-      input.harness !== "codex" || input.adoptIdentity)) throw new Error("Plugin Runner source reconciliation unavailable");
+      input.harness !== "codex" || input.adoptIdentity && Object.entries(input.priorIdentity!).some(([key, value]) =>
+        input.adoptIdentity![key as keyof DurableRecoveryIdentity] !== value))) throw new Error("Plugin Runner source reconciliation unavailable");
   const pollMs = input.pollMs ?? 500;
   let registrationGeneration = 0;
   let activeOutbound: ReturnType<typeof connectRunnerPrpIngress> | null = null;
   let preparedLaunchId: string | undefined;
   let preparedIdentity: DurableRecoveryIdentity | undefined = input.adoptIdentity;
   let launched = !!input.adoptIdentity;
+  let sourcePrepared = false;
   let stopRequested = false;
   let released = false;
   let submitted = !!input.adoptIdentity;
@@ -115,12 +117,13 @@ export function createPluginRunnerTaskOwner(input: {
   };
   const prepareLaunch: RunnerLaunchPreparer = async (requirements, recovery) => {
     if (released || stopRequested) throw new Error("Plugin Runner preparation cancelled");
-    const sourceRecovery = input.recoveryPurpose === "source_reconcile" && !launched;
+    const sourceRecovery = input.recoveryPurpose === "source_reconcile" && (!sourcePrepared ||
+      requirements.identity.runId === input.priorIdentity!.runId && preparedIdentity?.runId === input.priorIdentity!.runId);
     if (sourceRecovery && Object.entries(input.priorIdentity!).some(([key, value]) => requirements.identity[key as keyof DurableRecoveryIdentity] !== value)) {
       throw new Error("Plugin Runner source reconciliation identity mismatch");
     }
     // Reconnecting the previous authority must not prepare it through the new run's lease.
-    if (recovery && input.adoptIdentity && Object.entries(input.adoptIdentity).every(([key,value]) => requirements.identity[key as keyof DurableRecoveryIdentity] === value)) {
+    if (!sourceRecovery && recovery && input.adoptIdentity && Object.entries(input.adoptIdentity).every(([key,value]) => requirements.identity[key as keyof DurableRecoveryIdentity] === value)) {
       await authorizeRunnerAdoption(recovery.configurationId, requirements.identity);
       return recovery;
     }
@@ -136,7 +139,7 @@ export function createPluginRunnerTaskOwner(input: {
       ...(input.resumeFrom && (!input.recoveryPurpose || sourceRecovery) ? { resumeFrom: input.resumeFrom } : {}),
       ...(sourceRecovery ? { recoveryPurpose: "source_reconcile" as const } : {}),
       ...(input.accountIdentity ? { accountIdentity: input.accountIdentity } : {}),
-      ...(launched && preparedIdentity && requirements.identity.runId !== preparedIdentity.runId
+      ...(!sourceRecovery && launched && preparedIdentity && requirements.identity.runId !== preparedIdentity.runId
         ? { priorIdentity: preparedIdentity } : {}),
     }));
     if (released || stopRequested) throw new Error("Plugin Runner preparation cancelled");
@@ -145,6 +148,7 @@ export function createPluginRunnerTaskOwner(input: {
     if (launched || !result.projectAuthCheckAtSubmit) await checkProjectAuth(result.launch.configurationId);
     preparedLaunchId = result.launch.configurationId;
     preparedIdentity = requirements.identity;
+    if (sourceRecovery) sourcePrepared = true;
     return result.launch;
   };
   const readRunnerState = async () => {

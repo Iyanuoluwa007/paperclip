@@ -13415,8 +13415,8 @@ async function createRunnerdBackendWithinSessionClaim(
       // Warm retirement can outlive the run's temporary credential home; complete uses the durable handoff.
       onCredentials: input.execution.session.lifecyclePolicy.mode === "warm" ? undefined : credentials.onCredentials,
       warmTaskVersion: description.warmTaskVersion,
-      ...(input.stoppedSourceRecovery ? { recoveryPurpose: "source_reconcile" as const,
-        sourceRecoveryVersion: description.sourceRecoveryVersion } : {}),
+      authorityRunId: input.execution.binding.runId,
+      sourceRecoveryVersion: description.sourceRecoveryVersion,
       adoptIdentity: adoptionIdentity ?? (adopting && prior ? {
         runnerInstanceId: prior.runnerInstanceId, environmentLeaseId: prior.environmentLeaseId,
         runId: prior.runId, normalizedSessionId: prior.normalizedSessionId,
@@ -13466,12 +13466,11 @@ async function createRunnerdBackendWithinSessionClaim(
         return nativeCompletionFeedback(input.db, current.runId, result);
       },
       codexTransportFactory: recovery => createRunnerdCodexTransport({ provider: provider.kind, stateDirectory: root,
-        ...(input.stoppedSourceRecovery ? { recoveryPurpose: "source_reconcile" as const,
-          sourceRecoveryVersion: description.sourceRecoveryVersion, sourceReconciliationLaunch: input.stoppedSourceRecovery.launch }
-          : input.recoveryPurpose === "stop_cleanup" ? { recoveryPurpose: "stop_cleanup" as const } : {}),
+        ...(input.stoppedSourceRecovery ? { recoveryLaunch: input.stoppedSourceRecovery.launch } : {}),
+        ...(input.recoveryPurpose === "stop_cleanup" ? { recoveryPurpose: "stop_cleanup" as const } : {}),
         measureOperation: process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim() ? measureRunnerOperation : undefined,
         recordTimingReceipt: process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim() ? recordRunnerTimingReceipt : undefined,
-        ...owner.driver, runnerArtifact: input.stoppedSourceRecovery?.runnerArtifact ?? input.controllerPersistence?.runnerArtifact ?? description.runner,
+        ...owner.driver, get authorityRunId() { return owner.driver.authorityRunId; }, runnerArtifact: input.stoppedSourceRecovery?.runnerArtifact ?? input.controllerPersistence?.runnerArtifact ?? description.runner,
         controlPlaneRegistration: input.controllerPersistence ? async (authority, identity, signal) => {
           await nativeRunnerCheckpointRegistration({
             ...nativeRunnerCheckpointPersistence(input.db, input.controllerPersistence!.bootId,

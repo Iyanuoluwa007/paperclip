@@ -139,13 +139,13 @@ describe.skipIf(!recoveryPostgresSupport.supported)("stopped source admission un
       if (p.operation.kind === "check_project_auth") return { kind: "project_auth", taskId: p.taskId, provider: "openai", configurationId: p.operation.configurationId, allowed: true };
       return { kind: "accepted", taskId: p.taskId };
     }) };
-    const operation = { kind: "prepare" as const, resumeFrom: input.resumeFrom, recoveryPurpose: "source_reconcile" as const,
+    const operation = { kind: "prepare" as const, resumeFrom: input.resumeFrom,
       accountIdentity: input.accountIdentity, projectIds: [], requirements: { schema: "paperclip.runner.launch-requirements.v1" as const,
         identity, provider: "codex" as const, model: null, instructions: "Source policy", runtimeContext: null, settings: {}, approvalPolicy: "never" as const,
         readOnly: false, preparedConversation: false, includeCollaborationModeInstructions: false } };
     const task = (op: Parameters<typeof executeEnvironmentTask>[2]["operation"] = operation) => executeEnvironmentTask(db, workers as unknown as PluginWorkerManager,
       { companyId, leaseId, executionContext: context, operation: op });
-    return { ...input, runId, sourceRunId, sourceLeaseId, environmentId, pluginId, agentId, issueId, owner, oldOwner, oldWriter, checkpoint, execution, operation, workers, task,
+    return { ...input, runId, sourceRunId, sourceLeaseId, environmentId, pluginId, agentId, issueId, owner, oldOwner, oldWriter, checkpoint, execution, operation, workers, task, build,
       snapshot, controlState: structuredClone(core.store.state) };
   }
 
@@ -193,7 +193,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("stopped source admission un
         return { connectUrl: core.connectUrl, release: () => core.stop() }; },
     });
     const kill = (pid: number | null) => { if (pid) try { process.kill(-pid, "SIGKILL"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; } };
-    let completed = false, launchCount = 0, hostStopped = false;
+    let completed = false, launchCount = 0, hostStopped = false, detachedSourceAborted = false;
     let child: ReturnType<typeof spawn> | undefined, launchSpec: RunnerProcessLaunchSpec | undefined, endpoint = "";
     const ownerFactory = pluginRunner.createPluginRunnerTaskOwner;
     const spy = vi.spyOn(pluginRunner, "createPluginRunnerTaskOwner").mockImplementation(input => {
@@ -240,7 +240,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("stopped source admission un
           }
           case "check_project_auth": return { kind: "project_auth", taskId, configurationId: op.configurationId, provider: op.provider, allowed: true };
           case "submit": {
-            expect(op.recoveryPurpose).toBe("source_reconcile"); expect(op.runner.runId).toBe(f.sourceRunId); expect(params.runId).toBe(f.runId);
+            expect(op).not.toHaveProperty("recoveryPurpose"); expect(op.runner.runId).toBe(f.sourceRunId); expect(params.runId).toBe(f.runId);
             const listener = createServer(); await new Promise<void>(resolve => listener.listen(0, "127.0.0.1", resolve));
             const port = (listener.address() as { port: number }).port; await new Promise<void>(resolve => listener.close(() => resolve()));
             const args = [...launchSpec!.args], stateIndex = args.indexOf("--state-dir"); args[stateIndex + 1] = join(physicalRoot, "runner");
@@ -251,6 +251,11 @@ describe.skipIf(!recoveryPostgresSupport.supported)("stopped source admission un
           }
           case "read_state": {
             const state = JSON.parse(await readFile(join(physicalRoot, "runner", "runner-state.json"), "utf8"));
+            if (restart && state.runId === f.runId && !detachedSourceAborted) {
+              expect(f.context.active).toBe(true);
+              f.context.abort(new Error("detached source startup expired after target rotation"));
+              detachedSourceAborted = true;
+            }
             return { kind: "state", taskId, state };
           }
           case "status": return { kind: "status", taskId, phase: hostStopped ? "cancelled" : child?.exitCode != null ? "failed" : "running", executionStopped: hostStopped || child?.exitCode != null, sessionStateAvailable: false };
@@ -282,7 +287,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("stopped source admission un
         const admitted = await backend.recoverSession!(snapshot, { signal: f.context.signal });
         expect(admitted.recovered).toBe(true);
         if (!admitted.recovered) throw new Error("source fixture admission failed");
-        await admitted.session!.detachControllerForRestart!(); f.context.finish();
+        await admitted.session!.detachControllerForRestart!();
         const pid = child!.pid; expect(pid).toBeDefined(); expect(await calls("turn/start")).toBe(1);
         await db.update(nativeRunFinalizations).set({ leaseExpiresAt: new Date(Date.now() - 1_000) }).where(eq(nativeRunFinalizations.runId, f.runId));
         const [claimed] = await claimNativeRestartRecoveries({ db, restartKind: "hard", runIds: [f.runId] });
@@ -295,8 +300,41 @@ describe.skipIf(!recoveryPostgresSupport.supported)("stopped source admission un
       completed = true;
       expect(result.exitCode).toBe(0); expect(result.sessionDisplayId).toBe(snapshot.providerSessionId);
       expect(await calls("turn/start")).toBe(2); expect(launchCount).toBe(1);
+      expect(hostStopped).toBe(false); expect(detachedSourceAborted).toBe(restart);
       // B installs Core's tool declarations; the provider refresh keeps its thread.
       expect(await calls("process-start")).toBe(3);
+      // The next ordinary warm attachment must observe C's current owner through
+      // the reused transport, rather than freezing it under copied B authority.
+      const nextRunId = randomUUID(), nextLeaseId = randomUUID(), nextExecution = f.build(nextRunId);
+      const [accepted] = await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, f.runId));
+      expect(accepted.schemaStatus).toBe("accepted");
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(), resultJson: { summary: "Accepted B" } }).where(eq(heartbeatRuns.id, f.runId));
+      await db.update(nativeRunFinalizations).set({ phase: "committed", resultId: accepted.id, leaseOwner: null, leaseExpiresAt: null }).where(eq(nativeRunFinalizations.runId, f.runId));
+      const [retainedLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
+      const nextMetadata: Record<string, unknown> = { ...retainedLease.metadata, runnerTaskReused: true };
+      delete nextMetadata.runnerTaskSourceRecovery; delete nextMetadata.runnerTaskSourceConsumer;
+      await db.update(environmentLeases).set({ status: "retained" }).where(eq(environmentLeases.id, f.leaseId));
+      await db.insert(heartbeatRuns).values({ id: nextRunId, companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+        status: "running", runtimeMode: "native", nativeSessionId: f.identity.normalizedSessionId, runnerInstanceId: f.identity.runnerInstanceId,
+        completionContractId: nextExecution.completionContract.id, completionContractSha256: nextExecution.completionContract.sha256,
+        runnerProfileJson: { nativeExecutionInput: nextExecution } });
+      const currentController = await currentNativeControllerIdentity(), nextOwner = randomUUID();
+      await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: nextRunId, phase: "observed",
+        controllerBootId: currentController.bootId, controllerPid: currentController.pid, controllerProcessStartedAt: currentController.processStartedAt,
+        controllerGeneration: 1, leaseOwner: nextOwner, leaseExpiresAt: new Date(Date.now() + 60_000) });
+      await db.update(issues).set({ executionRunId: nextRunId }).where(eq(issues.id, f.issueId));
+      await db.insert(environmentLeases).values({ companyId: f.companyId, id: nextLeaseId, environmentId: f.environmentId, issueId: f.issueId,
+        heartbeatRunId: nextRunId, provider: retainedLease.provider, providerLeaseId: retainedLease.providerLeaseId,
+        leasePolicy: "reuse_by_environment", status: "active", metadata: nextMetadata });
+      const nextTarget = { ...target, leaseId: nextLeaseId,
+        sandboxLeaseAcquisition: { outcome: "resumed" as const, providerLeaseId: retainedLease.providerLeaseId! },
+        runnerTask: (operation: unknown, context?: { executionContext?: unknown }) => executeEnvironmentTask(db, f.workers as unknown as PluginWorkerManager,
+          { companyId: f.companyId, leaseId: nextLeaseId, operation: operation as never, executionContext: context?.executionContext }) };
+      const retainedPid = child!.pid;
+      const nextResult = await executePaperclipNativeSession({ ...execution, execution: nextExecution, runnerExecutionTarget: nextTarget,
+        leaseOwner: nextOwner, useRunnerd: true });
+      expect(nextResult.exitCode).toBe(0); expect(nextResult.sessionDisplayId).toBe(snapshot.providerSessionId);
+      expect(child!.pid).toBe(retainedPid); expect(launchCount).toBe(1); expect(await calls("turn/start")).toBe(3);
       const [unchanged] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
       expect(unchanged.status).toBe("succeeded"); expect(unchanged.resultJson).toEqual({ summary: "Accepted once" });
     } finally {
@@ -342,7 +380,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("stopped source admission un
     const f = await fixture(true); await claimPluginTaskSourceRecovery(db, f);
     if (dispatched) {
       await f.task(); await f.task({ kind: "check_project_auth", configurationId: "source-configuration", provider: "openai", projectIds: [] });
-      await f.task({ kind: "submit", recoveryPurpose: "source_reconcile", resumeFrom: f.resumeFrom,
+      await f.task({ kind: "submit", resumeFrom: f.resumeFrom,
       accountIdentity: f.accountIdentity, preparedLaunchId: "source-configuration", projectIds: [], bootstrapTicket: "synthetic-test-ticket",
       runner: { runnerId: f.identity.runnerInstanceId, leaseId: f.identity.environmentLeaseId, runId: f.sourceRunId,
         sessionId: f.identity.normalizedSessionId, turnId: f.identity.turnId, itemId: f.identity.itemId, harness: "codex", protocolMin: 1, protocolMax: 1 },
@@ -405,19 +443,19 @@ describe.skipIf(!recoveryPostgresSupport.supported)("stopped source admission un
       timeoutMs: 60_000, owner: f.owner })).rejects.toThrow("execution_changed");
   });
 
-  it("authorizes only the explicit source request while preserving A's accepted outcome", async () => {
+  it("authorizes only the claimed predecessor identity while preserving A's accepted outcome", async () => {
     const f = await fixture();
     const [before] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
     await expect(f.task()).rejects.toThrow("ownership_unverified");
     await claimPluginTaskSourceRecovery(db, f);
-    const attachment = { ...f.operation, recoveryPurpose: undefined, resumeFrom: undefined, priorIdentity: f.identity,
+    const attachment = { ...f.operation, resumeFrom: undefined, priorIdentity: f.identity,
       requirements: { ...f.operation.requirements, identity: { ...f.identity, runId: f.runId, turnId: `turn-${f.runId}`, itemId: `item-${f.runId}` } } };
     await expect(f.task(attachment)).rejects.toThrow("ownership_unverified");
     expect(f.workers.call).not.toHaveBeenCalled();
     await expect(f.task()).resolves.toMatchObject({ kind: "prepared" });
-    expect(f.workers.call.mock.calls[0][2]).toMatchObject({ runId: f.runId, operation: { recoveryPurpose: "source_reconcile", requirements: { identity: f.identity } } });
+    expect(f.workers.call.mock.calls[0][2]).toMatchObject({ runId: f.runId, operation: { requirements: { identity: f.identity } } });
     await f.task({ kind: "check_project_auth", configurationId: "source-configuration", provider: "openai", projectIds: [] });
-    await expect(f.task({ kind: "submit", recoveryPurpose: "source_reconcile", resumeFrom: f.resumeFrom,
+    await expect(f.task({ kind: "submit", resumeFrom: f.resumeFrom,
       accountIdentity: f.accountIdentity, preparedLaunchId: "source-configuration", projectIds: [], bootstrapTicket: "synthetic-test-ticket",
       runner: { runnerId: f.identity.runnerInstanceId, leaseId: f.identity.environmentLeaseId, runId: f.sourceRunId,
         sessionId: f.identity.normalizedSessionId, turnId: f.identity.turnId, itemId: f.identity.itemId, harness: "codex", protocolMin: 1, protocolMax: 1 },
@@ -425,7 +463,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("stopped source admission un
         maxOutboxBytes: 262144, p0ReserveBytes: 65536, lifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 } },
     })).resolves.toMatchObject({ kind: "accepted" });
     expect(f.workers.call.mock.calls.at(-1)![2]).toMatchObject({ runId: f.runId, operation: {
-      kind: "submit", recoveryPurpose: "source_reconcile", runner: { runId: f.sourceRunId },
+      kind: "submit", runner: { runId: f.sourceRunId },
     } });
     for (const key of ["runId", "runnerInstanceId", "environmentLeaseId", "normalizedSessionId"]) {
       await expect(f.task({ ...attachment, requirements: { ...attachment.requirements,
@@ -437,11 +475,32 @@ describe.skipIf(!recoveryPostgresSupport.supported)("stopped source admission un
     expect(f.workers.call.mock.calls.at(-1)![2]).toMatchObject({ runId: f.runId, operation: {
       kind: "prepare", priorIdentity: f.identity, requirements: { identity: { runId: f.runId } },
     } });
-    await expect(f.task({ ...f.operation, recoveryPurpose: undefined } as never)).rejects.toThrow("execution identity mismatch");
+    await expect(f.task({ ...f.operation, resumeFrom: undefined })).rejects.toThrow("ownership_unverified");
     const [after] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
     expect(after).toEqual(before);
     const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
     expect(JSON.stringify(lease.metadata)).not.toContain(f.owner.leaseOwner);
+  });
+
+  it("requires a complete claimed launch before any predecessor RPC", async () => {
+    const f = await fixture(); await claimPluginTaskSourceRecovery(db, f);
+    for (const operation of [
+      { ...f.operation, resumeFrom: undefined }, { ...f.operation, accountIdentity: undefined },
+      { ...f.operation, priorIdentity: f.identity },
+      { ...f.operation, requirements: { ...f.operation.requirements, provider: "acpx" as const } },
+    ]) await expect(f.task(operation)).rejects.toThrow("ownership_unverified");
+    const submit = { kind: "submit" as const, resumeFrom: f.resumeFrom, accountIdentity: f.accountIdentity,
+      preparedLaunchId: "source-configuration", projectIds: [], bootstrapTicket: "synthetic-test-ticket",
+      runner: { runnerId: f.identity.runnerInstanceId, leaseId: f.identity.environmentLeaseId, runId: f.sourceRunId,
+        sessionId: f.identity.normalizedSessionId, turnId: f.identity.turnId, itemId: f.identity.itemId, harness: "codex", protocolMin: 1, protocolMax: 1 },
+      launch: { runnerVersion: "source-fixture", runnerDigest: `sha256:${"a".repeat(64)}`,
+        maxOutboxBytes: 262144, p0ReserveBytes: 65536, lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } } };
+    for (const operation of [
+      { ...submit, resumeFrom: undefined }, { ...submit, accountIdentity: undefined },
+      { ...submit, preparedLaunchId: undefined }, { ...submit, launch: undefined },
+      { ...submit, runner: { ...submit.runner, harness: "claude" } },
+    ]) await expect(f.task(operation)).rejects.toThrow("ownership_unverified");
+    expect(f.workers.call).not.toHaveBeenCalled();
   });
 
   it.each(["runnerInstanceId", "environmentLeaseId", "runId", "normalizedSessionId", "turnId", "itemId"] as const)("rejects a different source %s", async key => {

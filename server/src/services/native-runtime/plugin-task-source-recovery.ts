@@ -37,7 +37,6 @@ function matchesLaunchPolicy(requirements: Requirements, execution: NativeExecut
   if (requestHarness(requirements) !== sourceHarness(execution)) return false;
   const provider = execution.provider;
   if (provider.kind !== "acpx") return true;
-  // Use Runner's pure factory for the same defaults as the actual prepared launch.
   let prepared: Record<string, unknown>;
   try {
     prepared = createRunnerProviderLaunch({ ...requirements, provider: "acpx", settings: {

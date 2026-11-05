@@ -106,6 +106,10 @@ journal after this claim. Workspace export and settlement holds still apply.
 After source submission, the same current owner can prepare its attachment with
 the exact source as `priorIdentity`. This does not grant ordinary warm reuse.
 
+Recovered accounting keeps its original producer and saved billing. Replaying a
+source receipt does not reopen its successful run or charge the current run.
+Each later warm attachment uses the current authority's accounting delivery.
+
 Core restores the source journal after it claims the consumer lease, so an old
 controller's final cleanup write cannot leave a stale local cut. Fresh source
 preparation uses the frozen source instructions and current account authority.

@@ -6,11 +6,12 @@ import WebSocket from "ws";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, companies, completionContracts, createDb, environmentLeases, environments, heartbeatRuns, issues, nativeRunFinalizations,
-  nativeRunResults, nativeRunnerCheckpoints, plugins } from "@paperclipai/db";
-import { DurablePrpControlPlane, type DurablePrpCheckpoint, type NativeExecutionInput, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
+  nativeRunResults, nativeRunnerCheckpoints, plugins, runUsageReceipts } from "@paperclipai/db";
+import * as runnerRuntime from "../../vendor/paperclip-runner/index.js";
+import { DurablePrpControlPlane, type DurablePrpCheckpoint, type NativeExecutionInput, type PrpEvent, type DurableRecoveryIdentity, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
 import { recoveryPostgresSupport, startRecoveryPostgres } from "../../__tests__/helpers/recovery-postgres.js";
 import { createIsolatedTestHome } from "../../__tests__/helpers/isolated-test-home.js";
 import { executeEnvironmentTask, resolvePluginTaskResume } from "../environment-task-runtime.js";
@@ -22,6 +23,7 @@ import { claimNativeRestartRecoveries, currentNativeControllerIdentity } from ".
 import { loadNativeRunnerCheckpoint, nativeRunnerCheckpointWriter, restoreNativeRunnerCheckpoint } from "./native-runner-checkpoint.js";
 import { claimPluginTaskSourceRecovery } from "./plugin-task-source-recovery.js";
 import { prepareNativeHeartbeatRun } from "./prepare-native-run.js";
+import { createNativeUsageDelivery } from "./native-usage-delivery.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
 import { createNativeControllerRecovery } from "./native-controller-recovery.js";
 import { createStoppedSourceExecutionContext, inspectStoppedPluginSourceRecovery, readPendingPluginSourceRecovery } from "./stopped-plugin-source-recovery.js";
@@ -185,15 +187,37 @@ describe.skipIf(!recoveryPostgresSupport.supported)("stopped source admission un
     await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, f.sourceRunId));
     await db.update(issues).set({ executionRunId: f.sourceRunId }).where(eq(issues.id, f.issueId));
     let retainedContext: RunnerProviderLaunchRequirements["runtimeContext"] = null;
+    let sourceReport: PrpEvent | undefined, sourceLastSequence = 0;
+    const sourceUsage = await createNativeUsageDelivery(db, { companyId: f.companyId, runId: f.sourceRunId,
+      runnerInstanceId: f.identity.runnerInstanceId, provider: sourceExecution.provider,
+      billing: { provider: "openai", biller: "openai", billingType: "metered_api" } });
     const original = createCapabilityRunnerdCodexTransport({ runnerBinary: binary, codexCommand: fakeCodex, codexArgs: providerArgs,
       stateDirectory: descriptor.root, runnerStateDirectory: join(physicalRoot, "runner"), sourceCodexHome: providerHome, prpIdentity: f.identity,
       lifecyclePolicy: sourceExecution.session.lifecyclePolicy, runnerProcessReconnectGraceMs: null,
+      onAccountingEvent: async event => { sourceLastSequence = Math.max(sourceLastSequence, event.sourceSeq); if (event.eventType === "usage.reported") sourceReport = event; await sourceUsage.capture(event); },
       runtimeContext: "runtimeContext" in sourceExecution ? sourceExecution.runtimeContext : null,
       controlPlaneRegistration: async core => { retainedContext = (core.store.state.runAttachTemplate!.provider as Record<string, unknown>).runtimeContext as typeof retainedContext; core.setCheckpointPersistence(f.oldWriter); await core.start();
         return { connectUrl: core.connectUrl, release: () => core.stop() }; },
     });
     const kill = (pid: number | null) => { if (pid) try { process.kill(-pid, "SIGKILL"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; } };
-    let completed = false, launchCount = 0, hostStopped = false, detachedSourceAborted = false;
+    let completed = false, launchCount = 0, hostStopped = false, detachedSourceAborted = false, lateSourceEventId = "";
+    let sourceReceiptCount = 0, nextWarmRunId = "", lateWarmEventId = "";
+    let warmSourceIdentity: DurableRecoveryIdentity | undefined;
+    const observedAccounting: PrpEvent[] = [];
+    let accountingHooks: NonNullable<Parameters<typeof runnerRuntime.createRunnerdCodexTransport>[0]> | undefined;
+    const createTransport = runnerRuntime.createRunnerdCodexTransport;
+    const transportSpy = vi.spyOn(runnerRuntime, "createRunnerdCodexTransport").mockImplementation(options => {
+      accountingHooks = options;
+      if (options?.onAccountingEvent) {
+        const capture = options.onAccountingEvent;
+        options.onAccountingEvent = async event => { observedAccounting.push(event); await capture(event); };
+      }
+      if (options?.onRecoveryAccountingEvent) {
+        const capture = options.onRecoveryAccountingEvent;
+        options.onRecoveryAccountingEvent = async (event, source) => { observedAccounting.push(event); await capture(event, source); };
+      }
+      return createTransport(options);
+    });
     let child: ReturnType<typeof spawn> | undefined, launchSpec: RunnerProcessLaunchSpec | undefined, endpoint = "";
     const ownerFactory = pluginRunner.createPluginRunnerTaskOwner;
     const spy = vi.spyOn(pluginRunner, "createPluginRunnerTaskOwner").mockImplementation(input => {
@@ -218,6 +242,8 @@ describe.skipIf(!recoveryPostgresSupport.supported)("stopped source admission un
       await db.update(issues).set({ executionRunId: f.runId }).where(eq(issues.id, f.issueId));
       const calls = async (method: string) => (await readFile(callLog, "utf8")).split("\n").filter(line => line === method).length;
       expect(await calls("turn/start")).toBe(1);
+      sourceReceiptCount = (await db.select().from(runUsageReceipts).where(eq(runUsageReceipts.runId, f.sourceRunId))).length;
+      expect(sourceReceiptCount).toBeGreaterThan(0); expect(sourceReport).toBeDefined();
       const credentialHome = join(physicalRoot, "credential"); await mkdir(credentialHome); await writeFile(join(credentialHome, "auth.json"), JSON.stringify({ OPENAI_API_KEY: "synthetic-fixture" }), { mode: 0o600 });
       const actualOutbound = await vi.importActual<typeof import("../../realtime/runner-prp-outbound.js")>("../../realtime/runner-prp-outbound.js");
       ingress.connect.mockImplementation(({ authority }) => {
@@ -232,6 +258,26 @@ describe.skipIf(!recoveryPostgresSupport.supported)("stopped source admission un
         try { switch (op.kind) {
           case "describe": return { ...description, taskId, runner: artifact, warmTaskVersion: 1 };
           case "prepare": {
+            if (op.requirements.identity.runId === f.runId && !lateSourceEventId) {
+              // Deliver an equal late A receipt twice through the recovered hook;
+              // B owns reconciliation while A keeps its original producer.
+              const late = { ...sourceReport!, sourceEventId: `late-source-${f.sourceRunId}`,
+                sourceSeq: Math.max(sourceLastSequence, ...observedAccounting.filter(event => event.runId === f.sourceRunId).map(event => event.sourceSeq)) + 1, emittedAt: new Date().toISOString() };
+              expect(accountingHooks?.onRecoveryAccountingEvent).toBeTypeOf("function");
+              await accountingHooks!.onRecoveryAccountingEvent!(late, f.identity);
+              await accountingHooks!.onRecoveryAccountingEvent!(late, f.identity);
+              lateSourceEventId = late.sourceEventId;
+            }
+            if (op.requirements.identity.runId === nextWarmRunId && !lateWarmEventId) {
+              const previous = observedAccounting.find(event => event.runId === f.runId && event.eventType === "usage.reported");
+              expect(previous).toBeDefined();
+              const late = { ...previous!, sourceEventId: `late-warm-${f.runId}`,
+                sourceSeq: Math.max(...observedAccounting.filter(event => event.runId === f.runId).map(event => event.sourceSeq)) + 1,
+                emittedAt: new Date().toISOString() };
+              await accountingHooks!.onAccountingEvent!(late);
+              await accountingHooks!.onRecoveryAccountingEvent!(late, warmSourceIdentity!);
+              lateWarmEventId = late.sourceEventId;
+            }
             const provider = createRunnerProviderLaunch(bindRunnerLaunchResources(op.requirements as RunnerProviderLaunchRequirements, retainedContext!),
               { options: { codexArgs: providerArgs }, root: descriptor.root, cwd: root, codexHome: join(descriptor.root, "codex-home"), codexCommand: fakeCodex,
                 providerNodeCommand: process.execPath, opencodeProxyPath: "", acpxSidecarPath: "" });
@@ -301,11 +347,17 @@ describe.skipIf(!recoveryPostgresSupport.supported)("stopped source admission un
       expect(result.exitCode).toBe(0); expect(result.sessionDisplayId).toBe(snapshot.providerSessionId);
       expect(await calls("turn/start")).toBe(2); expect(launchCount).toBe(1);
       expect(hostStopped).toBe(false); expect(detachedSourceAborted).toBe(restart);
+      expect((await db.select().from(runUsageReceipts).where(eq(runUsageReceipts.runId, f.runId))).length).toBeGreaterThan(0);
       // B installs Core's tool declarations; the provider refresh keeps its thread.
       expect(await calls("process-start")).toBe(3);
       // The next ordinary warm attachment must observe C's current owner through
       // the reused transport, rather than freezing it under copied B authority.
       const nextRunId = randomUUID(), nextLeaseId = randomUUID(), nextExecution = f.build(nextRunId);
+      nextWarmRunId = nextRunId;
+      const priorState = JSON.parse(await readFile(join(physicalRoot, "runner", "runner-state.json"), "utf8"));
+      expect(priorState.runId).toBe(f.runId);
+      warmSourceIdentity = { runnerInstanceId: priorState.runnerInstanceId, environmentLeaseId: priorState.environmentLeaseId,
+        runId: priorState.runId, normalizedSessionId: priorState.normalizedSessionId, turnId: priorState.turnId, itemId: priorState.itemId };
       const [accepted] = await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, f.runId));
       expect(accepted.schemaStatus).toBe("accepted");
       await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(), resultJson: { summary: "Accepted B" } }).where(eq(heartbeatRuns.id, f.runId));
@@ -335,11 +387,20 @@ describe.skipIf(!recoveryPostgresSupport.supported)("stopped source admission un
         leaseOwner: nextOwner, useRunnerd: true });
       expect(nextResult.exitCode).toBe(0); expect(nextResult.sessionDisplayId).toBe(snapshot.providerSessionId);
       expect(child!.pid).toBe(retainedPid); expect(launchCount).toBe(1); expect(await calls("turn/start")).toBe(3);
+      expect((await db.select().from(runUsageReceipts).where(eq(runUsageReceipts.runId, nextRunId))).length).toBeGreaterThan(0);
+      const lateReceipts = await db.select().from(runUsageReceipts).where(and(eq(runUsageReceipts.companyId, f.companyId),
+        sql`${runUsageReceipts.receiptJson}->'producerEvent'->>'sourceEventId' = ${lateSourceEventId}`));
+      expect(lateReceipts).toHaveLength(1); expect(lateReceipts[0].runId).toBe(f.sourceRunId);
+      const lateWarmReceipts = await db.select().from(runUsageReceipts).where(and(eq(runUsageReceipts.companyId, f.companyId),
+        sql`${runUsageReceipts.receiptJson}->'producerEvent'->>'sourceEventId' = ${lateWarmEventId}`));
+      expect(lateWarmReceipts).toHaveLength(1); expect(lateWarmReceipts[0].runId).toBe(f.runId);
+      await expect(accountingHooks!.onRecoveryAccountingEvent!(sourceReport!, f.identity)).rejects.toThrow("native_recovery_usage_source_unproven");
+      expect((await db.select().from(runUsageReceipts).where(eq(runUsageReceipts.runId, f.sourceRunId)))).toHaveLength(sourceReceiptCount + 1);
       const [unchanged] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
       expect(unchanged.status).toBe("succeeded"); expect(unchanged.resultJson).toEqual({ summary: "Accepted once" });
     } finally {
       if (completed) expect(await closeWarmNativeSessionsForEnvironment({ environmentId: f.environmentId, reason: "test cleanup" })).toMatchObject({ failed: 0 });
-      spy.mockRestore(); ingress.connect.mockReset(); kill(child?.pid ?? null);
+      spy.mockRestore(); transportSpy.mockRestore(); ingress.connect.mockReset(); kill(child?.pid ?? null);
       await new Promise<void>(resolve => api.close(() => resolve()));
       await original.transport.close().catch(() => undefined); const evidence = original.evidence(); kill(evidence.runnerPid); kill(evidence.codexPid);
     }

@@ -37,7 +37,7 @@ import { notifyExecutionRunWork } from "../execution-control-notifications.js";
 import { createRunUsageRecorder } from "../usage-receipts.js";
 import { registerPluginTaskCredentialHandoff, type PluginTaskCredentialWritebackBinding } from "../plugin-task-credential-writeback.js";
 import { resolvePluginTaskResume } from "../environment-task-runtime.js";
-import { environmentTaskResultSchema } from "@paperclipai/plugin-sdk";
+import { environmentTaskOperationSchema, environmentTaskResultSchema } from "@paperclipai/plugin-sdk";
 import { preparePluginRunnerCredentials } from "./plugin-runner-credentials.js";
 import { createPluginRunnerTaskOwner, verifyPluginRunnerTaskReattachment } from "./plugin-runner-task.js";
 import { NativeExecutionContext } from "./native-execution-context.js";
@@ -1842,7 +1842,9 @@ class SessionAuthorityEpoch {
   #revoked = false;
 
   constructor(runId: string, authority: PaperclipRunnerToolAuthority, private readonly toolTrace?: NativeToolTrace,
-    private readonly onAccountingEvent?: (event: PrpEvent) => Promise<void>) {
+    private readonly onAccountingEvent?: (event: PrpEvent) => Promise<void>,
+    private readonly onRecoveryAccountingEvent?: (event: PrpEvent, source: DurableRecoveryIdentity) => Promise<void>,
+    private readonly recoveryAccountingIdentity?: () => DurableRecoveryIdentity | undefined) {
     this.runId = runId;
     this.#authority = authority;
   }
@@ -1861,16 +1863,21 @@ class SessionAuthorityEpoch {
   async acceptAccountingEvent(event: PrpEvent) {
     if (!isNativeUsageAccountingEvent(event)) return;
     this.#assertCurrent();
-    if (event.runId !== this.runId) throw new Error("native_usage_run_binding_mismatch");
+    if (event.runId !== this.runId) {
+      const source = this.recoveryAccountingIdentity?.();
+      if (!source || event.runId !== source.runId) throw new Error("native_usage_run_binding_mismatch");
+      return this.acceptRecoveryAccountingEvent(event, source);
+    }
     await this.onAccountingEvent?.(event);
     this.#assertCurrent();
   }
 
-  async acceptRecoveryAccountingEvent(event: PrpEvent, capture: () => Promise<void>) {
+  async acceptRecoveryAccountingEvent(event: PrpEvent, source: DurableRecoveryIdentity) {
     if (!isNativeUsageAccountingEvent(event)) return;
     this.#assertCurrent();
     if (event.runId === this.runId) throw new Error("native_recovery_usage_source_unproven");
-    await capture();
+    if (!this.onRecoveryAccountingEvent) throw new Error("native_recovery_usage_source_unproven");
+    await this.onRecoveryAccountingEvent(event, source);
     this.#assertCurrent();
   }
 
@@ -13305,6 +13312,12 @@ async function createRunnerdBackendWithinSessionClaim(
     authority,
     input.toolTrace,
     input.onAccountingEvent,
+    input.onAccountingEvent ? async (event, source) => {
+      if (!recoveryUsage) throw new Error("native_recovery_usage_source_unproven");
+      await recoveryUsage(event, source);
+    } : undefined,
+    // Checkpoint inspection resolves the source before this epoch is published.
+    () => recoveryAccountingIdentity,
   );
   let dynamicTools: Awaited<
     ReturnType<SessionAuthorityEpoch["definitions"]>
@@ -13339,7 +13352,10 @@ async function createRunnerdBackendWithinSessionClaim(
     : undefined;
   if (retainedSystemInstructions === null) throw new Error("native_runner_recovery_instructions_unavailable");
   let stagedRecoveryPending = stagedRecovery !== null;
-  const recoveryUsageIdentity = stagedRecovery?.sourceIdentity ?? input.remoteWarmRecovery?.identity ?? durableIdentity;
+  const recoveryUsageIdentity = input.stoppedSourceRecovery?.identity ?? stagedRecovery?.sourceIdentity ?? input.remoteWarmRecovery?.identity ?? durableIdentity;
+  const recoveryIdentity = environmentTaskOperationSchema.safeParse({ kind: "read_state", identity: recoveryUsageIdentity });
+  const recoveryAccountingIdentity = recoveryIdentity.success && recoveryIdentity.data.kind === "read_state"
+    ? recoveryIdentity.data.identity : undefined;
   const recoveryUsage = input.onAccountingEvent && recoveryUsageIdentity
     ? createNativeRecoveryUsageDelivery({
         db: input.db, execution: input.execution, sourceIdentity: { ...recoveryUsageIdentity },
@@ -13347,6 +13363,18 @@ async function createRunnerdBackendWithinSessionClaim(
           nativeSessionConfigDigest(previous, target.kind) === nativeSessionConfigDigest(input.execution, target.kind),
       })
     : undefined;
+  const accountingHooks: Pick<NonNullable<Parameters<typeof createRunnerdCodexTransport>[0]>, "onAccountingEvent" | "onRecoveryAccountingEvent"> = {
+    onAccountingEvent: input.onAccountingEvent ? async event => {
+      const current = sessionToolAuthorityEpochs.get(sessionScopeId);
+      if (!current) throw new Error("native_session_authority_unavailable");
+      await current.acceptAccountingEvent(event);
+    } : undefined,
+    onRecoveryAccountingEvent: input.onAccountingEvent ? async (event, source) => {
+      const current = sessionToolAuthorityEpochs.get(sessionScopeId);
+      if (!current) throw new Error("native_recovery_usage_source_unproven");
+      await current.acceptRecoveryAccountingEvent(event, source);
+    } : undefined,
+  };
   const effectiveRunnerInstanceId =
     durableBinding?.runnerInstanceId ?? input.runnerInstanceId;
   const effectiveEnvironmentLeaseId =
@@ -13466,6 +13494,7 @@ async function createRunnerdBackendWithinSessionClaim(
         return nativeCompletionFeedback(input.db, current.runId, result);
       },
       codexTransportFactory: recovery => createRunnerdCodexTransport({ provider: provider.kind, stateDirectory: root,
+        ...accountingHooks,
         ...(input.stoppedSourceRecovery ? { recoveryLaunch: input.stoppedSourceRecovery.launch } : {}),
         ...(input.recoveryPurpose === "stop_cleanup" ? { recoveryPurpose: "stop_cleanup" as const } : {}),
         measureOperation: process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim() ? measureRunnerOperation : undefined,
@@ -14849,26 +14878,7 @@ async function createRunnerdBackendWithinSessionClaim(
         onSpawn: input.onSpawn,
         ...(input.execution.provider.kind === "codex" ? { disableCodexWebSearch: "webSearch" in input.execution.provider && input.execution.provider.webSearch === "disabled" } : {}),
         homeMode: preconfiguredHome ? "preconfigured" : "isolated",
-        onAccountingEvent: input.onAccountingEvent ? async event => {
-          const current = sessionToolAuthorityEpochs.get(sessionScopeId);
-          if (!current) throw new Error("native_session_authority_unavailable");
-          if (input.remoteWarmRecovery && event.runId === input.remoteWarmRecovery.identity.runId) {
-            if (!recoveryUsage) throw new Error("native_recovery_usage_source_unproven");
-            const source = input.remoteWarmRecovery.identity;
-            await current.acceptRecoveryAccountingEvent(event, () => recoveryUsage(event, {
-              runnerInstanceId: source.runnerInstanceId, environmentLeaseId: source.environmentLeaseId,
-              runId: source.runId, normalizedSessionId: source.normalizedSessionId,
-              turnId: source.turnId, itemId: source.itemId,
-            }));
-            return;
-          }
-          await current.acceptAccountingEvent(event);
-        } : undefined,
-        onRecoveryAccountingEvent: input.onAccountingEvent ? async (event, source) => {
-          const current = sessionToolAuthorityEpochs.get(sessionScopeId);
-          if (!current || !recoveryUsage) throw new Error("native_recovery_usage_source_unproven");
-          await current.acceptRecoveryAccountingEvent(event, () => recoveryUsage(event, source));
-        } : undefined,
+        ...accountingHooks,
         onCredentialsUpdated: (event) => appendNativeCredentialUpdate(input.db, {
           companyId: input.execution.binding.companyId,
           agentId: input.execution.binding.agentId,

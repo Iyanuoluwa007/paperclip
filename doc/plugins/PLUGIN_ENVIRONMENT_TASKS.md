@@ -89,7 +89,17 @@ and saves the result before it submits its configuration ID.
 `sourceRecoveryVersion: 1` in `describe` declares support for restoring a stopped
 Codex source without starting another turn. `acpxSourceRecoveryVersion: 1` is a
 separate ACPX capability; Codex support never implies ACPX support. These
-descriptions do not activate a provider without its matching Core admission.
+descriptions do not activate a provider without its matching Core admission and
+Runner execution driver. Core admission currently recognizes native Codex and
+qualified Claude through ACPX; ACPX Codex is a different provider and cannot use
+either attestation. Claude admission compares both saved and current profile
+snapshots with Runner's current qualified catalog, including all package versions
+and command digest. Historical profile decoding does not authorize recovery.
+Preparation, submission and attachment must retain that provider binding. Core
+normalizes Claude launch policy through Runner's launch factory before comparing
+model, mode, permissions, effort and runtime content with the corresponding saved
+source or current owner. It revalidates the claim and profiles after the worker
+returns; a reply cannot authorize a changed account, profile or controller epoch.
 The authenticated request belongs to
 the current run while `prepare` and `submit` carry the predecessor Runner identity.
 Core derives this relationship from its saved source-consumer claim; a mismatched
